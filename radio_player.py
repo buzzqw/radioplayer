@@ -724,7 +724,7 @@ class TerminalRadioPlayer:
                                 if title_match:
                                     stream_title = title_match.group(1).strip()
                                     
-                                                                                # Aggiorna solo se diverso dal precedente
+                                    # Aggiorna solo se diverso dal precedente
                                     if stream_title and stream_title != self.stream_title:
                                         old_artist = self.current_artist
                                         old_song = self.current_song
@@ -741,7 +741,10 @@ class TerminalRadioPlayer:
                                             if new_artist != self.current_artist or new_song != self.current_song:
                                                 self.current_artist = new_artist
                                                 self.current_song = new_song
-                                                
+                                                # PATCH: reset timer brano
+                                                self.current_song_start_time = time.time()
+                                                self.pause_start_time = None
+                                                self.total_pause_time = 0
                                                 # Mostra popup se è un vero cambio (non il primo caricamento)
                                                 if old_artist or old_song:
                                                     popup_thread = threading.Thread(
@@ -756,7 +759,10 @@ class TerminalRadioPlayer:
                                                 old_song_for_popup = self.current_song
                                                 self.current_artist = ""
                                                 self.current_song = stream_title
-                                                
+                                                # PATCH: reset timer brano
+                                                self.current_song_start_time = time.time()
+                                                self.pause_start_time = None
+                                                self.total_pause_time = 0
                                                 # Mostra popup se è un vero cambio (non il primo caricamento)
                                                 if old_song_for_popup:
                                                     popup_thread = threading.Thread(
@@ -776,6 +782,9 @@ class TerminalRadioPlayer:
             
             # Aspetta 2 secondi prima del prossimo controllo (più frequente per rilevare cambi)
             time.sleep(2)
+
+
+
     
     def monitor_stream_stats(self):
         """Monitora le statistiche tecniche dello stream ogni 2 secondi"""
