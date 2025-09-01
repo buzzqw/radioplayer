@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Radio Player M3U - Lettore di stazioni radio da file M3U (Cross-Platform)
+Radio Player M3U - VERSIONE CON AGGIORNAMENTO ZERO-LAMPEGGIAMENTO
 
 Copyright (C) 2025 Andres Zanzani <azanzani@gmail.com>
 
@@ -8,30 +8,6 @@ This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program. If not, see <https://www.gnu.org/licenses/>.
-
-Compatibile con Linux e Windows.
-
-Controlli:
-- Frecce Su/Giù: seleziona stazione (senza cambiarla)
-- p/Spazio/Invio: play/pausa stazione selezionata
-- m: muto/riattiva
-- +: alza volume
-- -: abbassa volume
-- t: toggle notifiche cambio brani
-- 1-9+Invio: vai a numero stazione
-- q: esci
-
-Requisiti:
-- Linux: mpv, libnotify-bin (opzionale per notifiche)
-- Windows: mpv.exe, pywin32 (opzionale), win10toast (opzionale)
 """
 
 import subprocess
@@ -99,9 +75,6 @@ class TerminalRadioPlayer:
         self.number_input_mode = False
         self.number_buffer = ""
         
-        # Flag per forzare aggiornamento interfaccia
-        self.force_update = False
-        
         # Popup cambio canzone
         self.show_song_popups = True
         self.last_song_info = ""
@@ -119,6 +92,40 @@ class TerminalRadioPlayer:
         
         # Configurazione terminale
         self.old_settings = None
+        
+        # Layout interfaccia - posizioni fisse delle righe
+        self.HEADER_LINE = 1
+        self.TITLE_LINE = 2
+        self.TIME_LINE = 3
+        self.SEPARATOR1_LINE = 4
+        self.EMPTY1_LINE = 5
+        self.STATUS_LINE = 6
+        self.SONG_ARTIST_LINE = 7
+        self.SONG_TITLE_LINE = 8
+        self.EMPTY2_LINE = 9
+        self.STATIONS_HEADER_LINE = 10
+        self.STATIONS_SEPARATOR_LINE = 11
+        self.STATIONS_START_LINE = 12
+        # Le stazioni occupano fino a 12 righe (STATIONS_START_LINE + 11)
+        self.CONTROLS_START_LINE = 25  # Dopo le stazioni
+        self.NUMBER_INPUT_LINE = 31
+        self.FOOTER_LINE = 32
+        self.COPYRIGHT_LINE = 33
+        
+        # Flag per tracciare cosa deve essere aggiornato
+        self.need_full_redraw = True
+        self.need_timer_update = True
+        self.need_status_update = False
+        self.need_song_update = False
+        self.need_stations_update = False
+        self.need_input_update = False
+        
+        # Cache per evitare aggiornamenti identici
+        self.last_timer_text = ""
+        self.last_status_text = ""
+        self.last_song_text = ""
+        self.last_stations_selection = -1
+        self.last_input_text = ""
         
         # Verifica MPV
         if not self.check_mpv():
@@ -142,7 +149,6 @@ class TerminalRadioPlayer:
     def setup_terminal(self):
         """Configura il terminale per input non bloccante"""
         if platform.system() == "Windows":
-            # Windows non ha bisogno di configurazione speciale
             pass
         else:
             self.old_settings = termios.tcgetattr(sys.stdin)
@@ -162,28 +168,26 @@ class TerminalRadioPlayer:
             if msvcrt.kbhit():
                 char = msvcrt.getch().decode('utf-8', errors='ignore')
                 
-                # Gestione tasti speciali su Windows
-                if char == '\xe0':  # Tasti speciali
+                if char == '\xe0':
                     char = msvcrt.getch().decode('utf-8', errors='ignore')
-                    if char == 'H':  # Freccia su
+                    if char == 'H':
                         return 'UP'
-                    elif char == 'P':  # Freccia giù
+                    elif char == 'P':
                         return 'DOWN'
-                    elif char == 'M':  # Freccia destra
+                    elif char == 'M':
                         return 'RIGHT'
-                    elif char == 'K':  # Freccia sinistra
+                    elif char == 'K':
                         return 'LEFT'
-                elif char == '\x1b':  # ESC
+                elif char == '\x1b':
                     return 'ESC'
                 
                 return char
             return None
         else:
-            # Linux/Unix
             if select.select([sys.stdin], [], [], 0.1) == ([sys.stdin], [], []):
                 char = sys.stdin.read(1)
                 
-                if char == '\x1b':  # Sequenza ESC
+                if char == '\x1b':
                     try:
                         next_chars = sys.stdin.read(2)
                         if next_chars == '[A':
@@ -201,6 +205,21 @@ class TerminalRadioPlayer:
                 
                 return char
             return None
+    
+    # Utility per controllo cursore ANSI
+    def move_to_line(self, line):
+        """Sposta il cursore alla riga specificata, colonna 1"""
+        print(f"\033[{line};1H", end="", flush=True)
+    
+    def clear_line(self):
+        """Pulisce la riga corrente"""
+        print("\033[K", end="", flush=True)
+    
+    def update_line(self, line, text):
+        """Aggiorna una riga specifica con nuovo testo"""
+        self.move_to_line(line)
+        self.clear_line()
+        print(text, end="", flush=True)
     
     def clear_screen(self):
         """Pulisce lo schermo"""
@@ -258,13 +277,10 @@ class TerminalRadioPlayer:
         """Restituisce il tempo di riproduzione del brano corrente"""
         if self.current_song_start_time and self.is_playing:
             if self.is_paused and self.pause_start_time:
-                # Se in pausa, calcola fino al momento della pausa
                 elapsed = self.pause_start_time - self.current_song_start_time - self.total_pause_time
             else:
-                # Se in riproduzione, calcola tempo totale meno pause
                 elapsed = time.time() - self.current_song_start_time - self.total_pause_time
             
-            # Non mostrare tempi negativi
             elapsed = max(0, elapsed)
             minutes = int(elapsed // 60)
             seconds = int(elapsed % 60)
@@ -285,12 +301,11 @@ class TerminalRadioPlayer:
         return "00:00"
     
     def get_right_info(self):
-        """Restituisce le informazioni tecniche di destra (bitrate, codec, buffer)"""
+        """Restituisce le informazioni tecniche di destra"""
         right_info = ""
         
-        # Bitrate (preferisce quello da MPV se disponibile)
         if self.audio_bitrate:
-            right_info += f"📊 {self.audio_bitrate}"
+            right_info += f"🔊 {self.audio_bitrate}"
         elif self.bitrate:
             if ',' in self.bitrate:
                 parts = self.bitrate.split(',')
@@ -301,57 +316,35 @@ class TerminalRadioPlayer:
                         numbers.append(int(match.group(1)))
                 if numbers:
                     min_bitrate = min(numbers)
-                    right_info += f"📊 {min_bitrate} kbps"
+                    right_info += f"🔊 {min_bitrate} kbps"
             else:
-                right_info += f"📊 {self.bitrate}"
+                right_info += f"🔊 {self.bitrate}"
         
-        # Codec
         if self.audio_codec:
             right_info += f" {self.audio_codec}"
         
-        # Buffer status
         if self.buffer_status:
             if self.buffer_status == "BUFFERING":
                 right_info += f" 🔄 {self.buffer_status}"
             else:
                 right_info += f" 📦 {self.buffer_status}"
         
-        # Cache duration
         if self.cache_duration:
             right_info += f" ⏱️ {self.cache_duration}"
                 
         return right_info
     
-    def display_interface(self):
-        """Mostra l'interfaccia del terminale"""
+    def draw_full_interface(self):
+        """Disegna l'interfaccia completa la prima volta"""
         self.clear_screen()
-        current_time = datetime.now().strftime("%H:%M:%S")
         
+        # Header fisso
         print("=" * 75)
-        print("🎵 RADIO PLAYER M3U - Versione Terminale")
+        print("🎵 RADIO PLAYER M3U - ZERO LAMPEGGIAMENTO")
         
-        # Linea con orario, uptime, volume e stato popup
-        time_line = f"⏰ {current_time}"
-        uptime_text = f"Uptime: {self.get_uptime()}"
+        # Riga time (verrà aggiornata dinamicamente)
+        print(" " * 75)  # Placeholder per timer
         
-        if self.is_muted:
-            volume_text = "🔇 MUTO"
-        else:
-            volume_text = f"🔊 {self.volume}%"
-            
-        popup_status = "🔔 ON" if self.show_song_popups else "🔔 OFF"
-        
-        # Calcola spazi per allineamento
-        total_width = 75
-        left_part = f"{time_line}  {uptime_text}"
-        right_part = f"{popup_status}  {volume_text}"
-        spaces_needed = total_width - len(left_part) - len(right_part) - 2
-        
-        if spaces_needed > 0:
-            print(f"{left_part}{' ' * spaces_needed}{right_part}")
-        else:
-            print(f"{left_part}  {right_part}")
-            
         print("=" * 75)
         print()
         
@@ -360,11 +353,78 @@ class TerminalRadioPlayer:
             print("Uso: python3 radio_player.py [file.m3u]")
             return
         
-        # Stato corrente
-        current_station = self.stations[self.selected_station_index]
+        # Placeholder per stato (verrà aggiornato dinamicamente)
+        print(" " * 75)  # STATUS_LINE
+        print(" " * 75)  # SONG_ARTIST_LINE 
+        print(" " * 75)  # SONG_TITLE_LINE
+        print()
+        print("📻 STAZIONI DISPONIBILI:")
+        print("-" * 50)
+        
+        # Placeholder per stazioni (verranno aggiornate dinamicamente)
+        for i in range(12):  # Spazio per max 12 righe di stazioni
+            print(" " * 75)
+        
+        print()
+        print("🎮 CONTROLLI:")
+        print("-" * 50)
+        
+        # Controlli fissi
+        controls = [
+            ("🔼 ↑/↓            : Seleziona stazione", "🔊 +/=            : Alza volume"),
+            ("▶️  p/Spazio/Invio : Play/Pausa", "  🔉 -/_            : Abbassa volume"),
+            ("🔇 m              : Muto/Riattiva", "🔢 1-9+Invio      : Vai a numero"),
+            ("🔔 t              : Toggle notifiche brani", "❌ q              : Esci")
+        ]
+        
+        for left, right in controls:
+            print(f"{left:<42}{right}")
+        
+        # Placeholder per input numero
+        print(" " * 75)  # NUMBER_INPUT_LINE
+        print("=" * 75)
+        print("© 2025 Andres Zanzani <azanzani@gmail.com> - GPL 3 License")
+        
+        # Ora forza l'aggiornamento di tutti gli elementi dinamici
+        self.need_full_redraw = False
+        self.need_timer_update = True
+        self.need_status_update = True
+        self.need_song_update = True
+        self.need_stations_update = True
+        self.need_input_update = True
+    
+    def update_timer_line(self):
+        """Aggiorna solo la riga del timer"""
+        current_time = datetime.now().strftime("%H:%M:%S")
+        time_line = f"⏰ {current_time}"
+        uptime_text = f"Uptime: {self.get_uptime()}"
+        
+        if self.is_muted:
+            volume_text = "🔇 MUTO"
+        else:
+            volume_text = f"🔊 {self.volume}%"
+            
+        popup_status = "🔔 ON" if self.show_song_popups else "🔕 OFF"
+        
+        total_width = 75
+        left_part = f"{time_line}  {uptime_text}"
+        right_part = f"{popup_status}  {volume_text}"
+        spaces_needed = total_width - len(left_part) - len(right_part) - 2
+        
+        if spaces_needed > 0:
+            timer_text = f"{left_part}{' ' * spaces_needed}{right_part}"
+        else:
+            timer_text = f"{left_part}  {right_part}"
+        
+        # Aggiorna solo se è cambiato
+        if timer_text != self.last_timer_text:
+            self.update_line(self.TIME_LINE, timer_text)
+            self.last_timer_text = timer_text
+    
+    def update_status_line(self):
+        """Aggiorna solo la riga dello stato"""
         playing_station = self.stations[self.playing_station_index] if self.playing_station_index >= 0 else None
         
-        # Stato su una linea - senza ripetizione
         if self.is_playing and not self.is_paused:
             status = "▶️ IN RIPRODUZIONE"
         elif self.is_paused:
@@ -373,15 +433,22 @@ class TerminalRadioPlayer:
             status = "⏹️ FERMATO"
         
         if playing_station:
-            print(f"📡 STATO: {status} • {playing_station.name}")
+            status_text = f"📡 STATO: {status} • {playing_station.name}"
         else:
-            print(f"📡 STATO: {status}")
+            status_text = f"📡 STATO: {status}"
         
-        # Informazioni brano corrente - senza riga vuota sopra
+        # Aggiorna solo se è cambiato
+        if status_text != self.last_status_text:
+            self.update_line(self.STATUS_LINE, status_text)
+            self.last_status_text = status_text
+    
+    def update_song_info(self):
+        """Aggiorna solo le righe delle informazioni del brano"""
+        artist_line = ""
+        title_line = ""
+        
         if self.is_playing:
-            
             if self.current_artist and self.current_song:
-                # Artista e titolo separati
                 artist_line = f"🎤 Artista: {self.current_artist}"
                 right_info = self.get_right_info()
                 
@@ -391,9 +458,7 @@ class TerminalRadioPlayer:
                         artist_line += " " * spaces_needed + right_info
                     else:
                         artist_line += f"  {right_info}"
-                print(artist_line)
                 
-                # Titolo con tempo brano
                 song_time = self.get_current_song_time()
                 title_line = f"🎼 Titolo: {self.current_song}"
                 if song_time != "00:00":
@@ -403,10 +468,8 @@ class TerminalRadioPlayer:
                         title_line += " " * spaces_needed + time_info
                     else:
                         title_line += f"  {time_info}"
-                print(title_line)
                 
             elif self.current_song:
-                # Solo titolo (senza artista)
                 song_line = f"🎼 {self.current_song}"
                 song_time = self.get_current_song_time()
                 right_parts = []
@@ -423,10 +486,12 @@ class TerminalRadioPlayer:
                         song_line += " " * spaces_needed + right_info
                     else:
                         song_line += f"  {right_info}"
-                print(song_line)
+                
+                # In questo caso, metti tutto sulla riga artist e lascia title vuota
+                artist_line = song_line
+                title_line = ""
                 
             elif self.stream_title:
-                # Stream title generico
                 title_line = f"📺 {self.stream_title}"
                 right_info = self.get_right_info()
                 
@@ -436,89 +501,130 @@ class TerminalRadioPlayer:
                         title_line += " " * spaces_needed + right_info
                     else:
                         title_line += f"  {right_info}"
-                print(title_line)
-                
+                        
+                artist_line = ""
             else:
-                # Messaggio di caricamento - senza volume
-                loading_line = f"🎤 Caricamento informazioni..."
+                artist_line = f"🎤 Caricamento informazioni..."
                 right_info = self.get_right_info()
                 
                 if right_info:
-                    spaces_needed = 73 - len(loading_line) - len(right_info)
+                    spaces_needed = 73 - len(artist_line) - len(right_info)
                     if spaces_needed > 0:
-                        loading_line += " " * spaces_needed + right_info
+                        artist_line += " " * spaces_needed + right_info
                     else:
-                        loading_line += f"  {right_info}"
-                print(loading_line)
+                        artist_line += f"  {right_info}"
+                        
+                title_line = ""
         
-        print()
-        print("📻 STAZIONI DISPONIBILI:")
-        print("-" * 50)
+        song_text = f"{artist_line}|{title_line}"  # Uso | come separatore per cache
         
-        # Mostra fino a 10 stazioni con scroll
-        start_idx = max(0, self.selected_station_index - 5)
-        end_idx = min(len(self.stations), start_idx + 10)
-        
-        if start_idx > 0:
-            print("    ⬆️  ... altre stazioni sopra ...")
-        
-        for i in range(start_idx, end_idx):
-            station = self.stations[i]
-            markers = ""
+        # Aggiorna solo se è cambiato
+        if song_text != self.last_song_text:
+            self.update_line(self.SONG_ARTIST_LINE, artist_line)
+            self.update_line(self.SONG_TITLE_LINE, title_line)
+            self.last_song_text = song_text
+    
+    def update_stations_list(self):
+        """Aggiorna solo la lista delle stazioni quando cambia la selezione"""
+        # Aggiorna solo se è cambiata la selezione
+        if self.selected_station_index != self.last_stations_selection:
+            start_idx = max(0, self.selected_station_index - 5)
+            end_idx = min(len(self.stations), start_idx + 10)
             
-            if i == self.selected_station_index:
-                markers += "👆"
+            line_counter = 0
+            
+            if start_idx > 0:
+                self.update_line(self.STATIONS_START_LINE + line_counter, "    ⬆️  ... altre stazioni sopra ...")
+                line_counter += 1
             else:
-                markers += "  "
+                self.update_line(self.STATIONS_START_LINE + line_counter, "")
+                line_counter += 1
             
-            if i == self.playing_station_index and self.is_playing:
-                if not self.is_paused:
-                    markers += " ▶️"
+            for i in range(start_idx, end_idx):
+                station = self.stations[i]
+                markers = ""
+                
+                if i == self.selected_station_index:
+                    markers += "👆"
                 else:
-                    markers += " ⏸️"
-            else:
-                markers += "  "
+                    markers += "  "
+                
+                if i == self.playing_station_index and self.is_playing:
+                    if not self.is_paused:
+                        markers += " ▶️"
+                    else:
+                        markers += " ⏸️"
+                else:
+                    markers += "  "
+                
+                line_text = f"{markers} {i+1:2d}. {station.name}"
+                
+                if i == self.selected_station_index:
+                    line_text = f"\033[7m{line_text}\033[0m"  # Inversione colori
+                
+                self.update_line(self.STATIONS_START_LINE + line_counter, line_text)
+                line_counter += 1
             
-            line = f"{markers} {i+1:2d}. {station.name}"
+            if end_idx < len(self.stations):
+                self.update_line(self.STATIONS_START_LINE + line_counter, "    ⬇️  ... altre stazioni sotto ...")
+                line_counter += 1
+            else:
+                self.update_line(self.STATIONS_START_LINE + line_counter, "")
+                line_counter += 1
             
-            if i == self.selected_station_index:
-                print(f"\033[7m{line}\033[0m")
-            else:
-                print(line)
-        
-        if end_idx < len(self.stations):
-            print("    ⬇️  ... altre stazioni sotto ...")
-        
-        print()
-        print("🎮 CONTROLLI:")
-        print("-" * 50)
-        controls = [
-            ("🔼 ↑/↓            : Seleziona stazione", "🔊 +/=            : Alza volume"),
-            ("▶️  p/Spazio/Invio : Play/Pausa", "  🔉 -/_            : Abbassa volume"),
-            ("🔇 m              : Muto/Riattiva", "🔢 1-9+Invio      : Vai a numero"),
-            ("🔔 t              : Toggle notifiche brani", "❌ q              : Esci")
-        ]
-        
-        for left, right in controls:
-            if right:
-                print(f"{left:<42}{right}")
-            else:
-                print(left)
-        
+            # Pulisci righe rimaste
+            while line_counter < 12:
+                self.update_line(self.STATIONS_START_LINE + line_counter, "")
+                line_counter += 1
+            
+            self.last_stations_selection = self.selected_station_index
+    
+    def update_input_line(self):
+        """Aggiorna solo la riga dell'input numerico"""
         if self.number_input_mode:
-            print()
-            print(f"🔢 INSERISCI NUMERO: {self.number_buffer}_ (Invio per confermare, Esc per annullare)")
+            input_text = f"🔢 INSERISCI NUMERO: {self.number_buffer}_ (Invio per confermare, Esc per annullare)"
+        else:
+            input_text = ""
         
-        print("=" * 75)
-        print("© 2025 Andres Zanzani <azanzani@gmail.com> - GPL 3 License")
+        # Aggiorna solo se è cambiato
+        if input_text != self.last_input_text:
+            self.update_line(self.NUMBER_INPUT_LINE, input_text)
+            self.last_input_text = input_text
+    
+    def display_interface(self):
+        """Gestisce gli aggiornamenti dell'interfaccia in modo ottimale"""
+        # Primo disegno completo
+        if self.need_full_redraw:
+            self.draw_full_interface()
+            return
+        
+        # Aggiornamenti parziali secondo necessità
+        if self.need_timer_update:
+            self.update_timer_line()
+            self.need_timer_update = False
+        
+        if self.need_status_update:
+            self.update_status_line()
+            self.need_status_update = False
+        
+        if self.need_song_update:
+            self.update_song_info()
+            self.need_song_update = False
+        
+        if self.need_stations_update:
+            self.update_stations_list()
+            self.need_stations_update = False
+        
+        if self.need_input_update:
+            self.update_input_line()
+            self.need_input_update = False
     
     def show_song_popup(self, artist, song):
-        """Mostra notifica di sistema per cambio canzone - cross-platform"""
+        """Mostra notifica di sistema per cambio canzone"""
         if not self.show_song_popups:
             return
             
         try:
-            # Prepara il messaggio per la notifica
             if artist and song:
                 message = f"{artist} - {song}"
                 title = "🎵 Nuovo Brano"
@@ -529,86 +635,28 @@ class TerminalRadioPlayer:
                 return
             
             if platform.system() == "Windows":
-                # Windows: usa toast notifications o fallback
                 try:
-                    # Prova con win10toast se disponibile
                     from win10toast import ToastNotifier
                     toaster = ToastNotifier()
                     toaster.show_toast(title, message, icon_path=None, duration=4)
                 except ImportError:
-                    # Fallback: usa messagebox
                     if WIN32_AVAILABLE:
                         import win32api
                         win32api.MessageBox(0, message, title, win32con.MB_ICONINFORMATION | win32con.MB_SETFOREGROUND)
-                    else:
-                        # Ultimo fallback: stampa nel terminale
-                        print(f"\n🔔 {title}: {message}")
             else:
-                # Linux: prova diversi metodi di notifica
-                notification_sent = False
-                
-                # Metodo 1: notify-send standard
                 try:
-                    result = subprocess.run([
-                        'notify-send',
-                        title,
-                        message,
-                        '--icon=audio-x-generic',
-                        '--expire-time=4000',
-                        '--app-name=RadioPlayer'
-                    ], check=True, capture_output=True, text=True, timeout=5)
-                    notification_sent = True
+                    subprocess.run([
+                        'notify-send', title, message,
+                        '--icon=audio-x-generic', '--expire-time=4000'
+                    ], check=True, capture_output=True, timeout=5)
                 except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-                    pass
-                
-                # Metodo 2: notify-send semplificato
-                if not notification_sent:
                     try:
-                        result = subprocess.run([
-                            'notify-send',
-                            f"{title}: {message}"
-                        ], check=True, capture_output=True, text=True, timeout=5)
-                        notification_sent = True
-                    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                        subprocess.run(['notify-send', f"{title}: {message}"], 
+                                     check=True, capture_output=True, timeout=5)
+                    except:
                         pass
-                
-                # Metodo 3: gdbus (per GNOME/systemd)
-                if not notification_sent:
-                    try:
-                        subprocess.run([
-                            'gdbus', 'call', '--session',
-                            '--dest=org.freedesktop.Notifications',
-                            '--object-path=/org/freedesktop/Notifications',
-                            '--method=org.freedesktop.Notifications.Notify',
-                            'RadioPlayer', '0', 'audio-x-generic',
-                            title, message, '[]', '{}', '4000'
-                        ], check=True, capture_output=True, text=True, timeout=5)
-                        notification_sent = True
-                    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-                        pass
-                
-                # Metodo 4: zenity
-                if not notification_sent:
-                    try:
-                        subprocess.run([
-                            'zenity', '--notification',
-                            f'--text={title}: {message}',
-                            '--timeout=4'
-                        ], check=True, capture_output=True, text=True, timeout=5)
-                        notification_sent = True
-                    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-                        pass
-                
-                # Se nessun metodo funziona, fallback nel terminale
-                if not notification_sent:
-                    print(f"\n🔔 {title}: {message}")
-            
-        except Exception as e:
-            # Fallback universale: stampa nel terminale
-            if artist and song:
-                print(f"\n🔔 Nuovo brano: {artist} - {song}")
-            elif song:
-                print(f"\n🔔 In onda: {song}")
+        except Exception:
+            pass
     
     def play_selected_station(self):
         """Avvia la riproduzione della stazione selezionata"""
@@ -621,38 +669,20 @@ class TerminalRadioPlayer:
         self.playing_station_index = self.selected_station_index
         
         try:
-            # Rimuovi socket/pipe precedente se esiste
-            if platform.system() == "Windows":
-                # Su Windows MPV usa named pipes
-                pass  # Non serve rimuovere named pipes
-            else:
-                if os.path.exists(self.mpv_socket):
-                    os.remove(self.mpv_socket)
+            if platform.system() != "Windows" and os.path.exists(self.mpv_socket):
+                os.remove(self.mpv_socket)
             
             cmd = [
-                'mpv',
-                '--no-video',
-                '--volume=' + str(self.volume),
-                '--quiet',
-                '--no-terminal',
-                '--cache=yes',
-                '--demuxer-max-bytes=1M',
-                '--audio-buffer=0.1'
+                'mpv', '--no-video', f'--volume={self.volume}',
+                '--quiet', '--no-terminal', '--cache=yes',
+                '--demuxer-max-bytes=1M', '--audio-buffer=0.1',
+                f'--input-ipc-server={self.mpv_socket}',
+                station.url
             ]
             
-            # Aggiungi IPC server in base al sistema operativo
-            if platform.system() == "Windows":
-                cmd.append('--input-ipc-server=' + self.mpv_socket)
-            else:
-                cmd.append('--input-ipc-server=' + self.mpv_socket)
-            
-            cmd.append(station.url)
-            
             self.mpv_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=os.setsid
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid if platform.system() != "Windows" else None
             )
             
             time.sleep(1)
@@ -661,245 +691,121 @@ class TerminalRadioPlayer:
                 self.is_playing = True
                 self.is_paused = False
                 self.start_time = time.time()
-                self.current_song_start_time = time.time()  # Inizia timer brano
-                self.pause_start_time = None  # Reset pause timer
-                self.total_pause_time = 0     # Reset pause totale
+                self.current_song_start_time = time.time()
+                self.pause_start_time = None
+                self.total_pause_time = 0
                 
-                # Avvia thread per metadati e statistiche continue
-                metadata_thread = threading.Thread(target=self.monitor_metadata_continuous, daemon=True)
-                metadata_thread.start()
+                # Marca aggiornamenti necessari
+                self.need_status_update = True
+                self.need_song_update = True
+                self.need_stations_update = True
                 
-                # Avvia thread separato per statistiche tecniche (più frequente)
-                stats_thread = threading.Thread(target=self.monitor_stream_stats, daemon=True)
-                stats_thread.start()
+                # Avvia monitoraggio
+                threading.Thread(target=self.monitor_metadata_continuous, daemon=True).start()
+                threading.Thread(target=self.monitor_stream_stats, daemon=True).start()
                 
-        except Exception as e:
+        except Exception:
             self.is_playing = False
             self.playing_station_index = -1
+            self.need_status_update = True
     
     def monitor_metadata_continuous(self):
-        """Monitora i metadati dello stream ogni 5 secondi"""
+        """Monitora i metadati dello stream"""
         while self.is_playing and self.running and self.playing_station_index >= 0:
             station = self.stations[self.playing_station_index]
             
             try:
-                headers = {
-                    'Icy-MetaData': '1',
-                    'User-Agent': 'RadioPlayer/1.0',
-                    'Accept': '*/*',
-                    'Range': 'bytes=0-'  # Richiedi solo l'inizio dello stream
-                }
-                
-                # Timeout breve per non bloccare
+                headers = {'Icy-MetaData': '1', 'User-Agent': 'RadioPlayer/1.0'}
                 response = requests.get(station.url, headers=headers, stream=True, timeout=3)
                 
-                # Estrae bitrate solo la prima volta
                 if not self.bitrate:
                     icy_bitrate = response.headers.get('icy-br', '')
                     if icy_bitrate:
                         self.bitrate = f"{icy_bitrate} kbps"
+                        self.need_song_update = True
                 
-                # Estrae metaint per i metadati
                 metaint = response.headers.get('icy-metaint')
                 if metaint:
                     try:
                         metaint = int(metaint)
-                        
-                        # Legge dati audio
                         audio_data = response.raw.read(metaint)
-                        
-                        # Legge lunghezza metadati
                         meta_length_byte = response.raw.read(1)
                         
                         if meta_length_byte:
                             meta_length = ord(meta_length_byte) * 16
                             
                             if meta_length > 0:
-                                # Legge metadati
                                 metadata = response.raw.read(meta_length).decode('utf-8', errors='ignore')
-                                
-                                # Estrae StreamTitle
                                 title_match = re.search(r"StreamTitle='([^']*)'", metadata)
                                 
                                 if title_match:
                                     stream_title = title_match.group(1).strip()
                                     
-                                    # Aggiorna solo se diverso dal precedente
                                     if stream_title and stream_title != self.stream_title:
                                         old_artist = self.current_artist
                                         old_song = self.current_song
                                         
                                         self.stream_title = stream_title
                                         
-                                        # Prova a separare artista - titolo
                                         if ' - ' in stream_title:
                                             parts = stream_title.split(' - ', 1)
                                             new_artist = parts[0].strip()
                                             new_song = parts[1].strip()
                                             
-                                            # Aggiorna solo se cambiato
                                             if new_artist != self.current_artist or new_song != self.current_song:
                                                 self.current_artist = new_artist
                                                 self.current_song = new_song
-                                                # PATCH: reset timer brano
                                                 self.current_song_start_time = time.time()
                                                 self.pause_start_time = None
                                                 self.total_pause_time = 0
-                                                # Mostra popup se è un vero cambio (non il primo caricamento)
+                                                self.need_song_update = True
+                                                
                                                 if old_artist or old_song:
-                                                    popup_thread = threading.Thread(
-                                                        target=self.show_song_popup, 
-                                                        args=(new_artist, new_song), 
-                                                        daemon=True
-                                                    )
-                                                    popup_thread.start()
+                                                    threading.Thread(target=self.show_song_popup, 
+                                                                   args=(new_artist, new_song), daemon=True).start()
                                         else:
-                                            # Se non c'è separatore, metti tutto come titolo
                                             if stream_title != self.current_song:
                                                 old_song_for_popup = self.current_song
                                                 self.current_artist = ""
                                                 self.current_song = stream_title
-                                                # PATCH: reset timer brano
                                                 self.current_song_start_time = time.time()
                                                 self.pause_start_time = None
                                                 self.total_pause_time = 0
-                                                # Mostra popup se è un vero cambio (non il primo caricamento)
+                                                self.need_song_update = True
+                                                
                                                 if old_song_for_popup:
-                                                    popup_thread = threading.Thread(
-                                                        target=self.show_song_popup, 
-                                                        args=("", stream_title), 
-                                                        daemon=True
-                                                    )
-                                                    popup_thread.start()
+                                                    threading.Thread(target=self.show_song_popup, 
+                                                                   args=("", stream_title), daemon=True).start()
                     except Exception:
                         pass
                 
                 response.close()
-                
             except Exception:
-                # In caso di errore, non fare nulla e continua
                 pass
             
-            # Aspetta 2 secondi prima del prossimo controllo (più frequente per rilevare cambi)
             time.sleep(2)
-
-
-
     
     def monitor_stream_stats(self):
-        """Monitora le statistiche tecniche dello stream ogni 2 secondi"""
-        # Aspetta un po' che MPV si stabilizzi
+        """Monitora le statistiche tecniche dello stream"""
         time.sleep(3)
         
         while self.is_playing and self.running and self.playing_station_index >= 0:
             self.update_stream_stats()
-            time.sleep(2)  # Aggiorna ogni 2 secondi
-    
-    def toggle_play_pause(self):
-        """Avvia/pausa la riproduzione"""
-        if not self.stations:
-            return
-        
-        if not self.is_playing:
-            self.play_selected_station()
-        else:
-            if self.playing_station_index != self.selected_station_index:
-                self.play_selected_station()
-            else:
-                if self.mpv_process and self.mpv_process.poll() is None:
-                    if self.is_paused:
-                        self.play_selected_station()
-                    else:
-                        os.killpg(os.getpgid(self.mpv_process.pid), signal.SIGSTOP)
-                        self.is_paused = True
-    
-    def stop(self):
-        """Ferma la riproduzione - cross-platform"""
-        if self.mpv_process:
-            try:
-                if platform.system() == "Windows":
-                    # Windows: termina processo direttamente
-                    self.mpv_process.terminate()
-                    self.mpv_process.wait(timeout=2)
-                else:
-                    # Linux: usa killpg
-                    os.killpg(os.getpgid(self.mpv_process.pid), signal.SIGTERM)
-                    self.mpv_process.wait(timeout=2)
-            except:
-                try:
-                    if platform.system() == "Windows":
-                        self.mpv_process.kill()
-                    else:
-                        os.killpg(os.getpgid(self.mpv_process.pid), signal.SIGKILL)
-                except:
-                    pass
-            self.mpv_process = None
-        
-        # Pulisci socket/pipe
-        if platform.system() == "Linux" and os.path.exists(self.mpv_socket):
-            try:
-                os.remove(self.mpv_socket)
-            except:
-                pass
-        
-        self.is_playing = False
-        self.is_paused = False
-        self.current_song = ""
-        self.current_artist = ""
-        self.stream_title = ""
-        self.bitrate = ""
-        self.start_time = None
-        self.playing_station_index = -1
-        
-        # Pulisci statistiche tecniche
-        self.audio_bitrate = ""
-        self.buffer_status = ""
-        self.audio_codec = ""
-        self.cache_duration = ""
-        self.current_song_start_time = None
-        self.pause_start_time = None
-        self.total_pause_time = 0
-    
-    def change_selection(self, direction):
-        """Cambia selezione"""
-        if not self.stations:
-            return
-        self.selected_station_index = (self.selected_station_index + direction) % len(self.stations)
-    
-    def select_by_number(self, number):
-        """Seleziona stazione per numero"""
-        if not self.stations:
-            return
-        if 1 <= number <= len(self.stations):
-            self.selected_station_index = number - 1
+            time.sleep(2)
     
     def get_mpv_property(self, property_name):
-        """Ottiene una proprietà da MPV tramite IPC - cross-platform"""
+        """Ottiene una proprietà da MPV tramite IPC"""
         try:
-            import json
-            
-            # Crea il comando JSON
-            cmd = {
-                "command": ["get_property", property_name]
-            }
+            cmd = {"command": ["get_property", property_name]}
             message = json.dumps(cmd) + "\n"
             
             if platform.system() == "Windows":
-                # Windows: usa named pipes
                 try:
                     import win32file
-                    import win32pipe
-                    
                     handle = win32file.CreateFile(
-                        self.mpv_socket,
-                        win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                        0,
-                        None,
-                        win32file.OPEN_EXISTING,
-                        0,
-                        None
+                        self.mpv_socket, win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                        0, None, win32file.OPEN_EXISTING, 0, None
                     )
-                    
                     win32file.WriteFile(handle, message.encode('utf-8'))
                     result, data = win32file.ReadFile(handle, 1024)
                     win32file.CloseHandle(handle)
@@ -909,10 +815,8 @@ class TerminalRadioPlayer:
                         if response.get("error") == "success":
                             return response.get("data")
                 except ImportError:
-                    # Fallback se win32 non disponibile
                     return None
             else:
-                # Linux: usa socket Unix
                 if not os.path.exists(self.mpv_socket):
                     return None
                 
@@ -929,7 +833,6 @@ class TerminalRadioPlayer:
                         return result.get("data")
             
             return None
-            
         except Exception:
             return None
     
@@ -937,67 +840,68 @@ class TerminalRadioPlayer:
         """Aggiorna le statistiche dello stream"""
         if not self.is_playing or not self.mpv_process or self.mpv_process.poll() is not None:
             return
-            
-        # Ottieni bitrate audio
+        
+        changed = False
+        
+        # Bitrate
         bitrate = self.get_mpv_property("audio-bitrate")
         if bitrate:
-            self.audio_bitrate = f"{int(bitrate/1000)} kbps"
+            new_bitrate = f"{int(bitrate/1000)} kbps"
+            if new_bitrate != self.audio_bitrate:
+                self.audio_bitrate = new_bitrate
+                changed = True
         
-        # Ottieni codec audio
+        # Codec
         codec = self.get_mpv_property("audio-codec-name")
         if codec:
-            self.audio_codec = codec.upper()
+            new_codec = codec.upper()
+            if new_codec != self.audio_codec:
+                self.audio_codec = new_codec
+                changed = True
         
-        # Ottieni durata buffer
+        # Cache duration (non causa refresh immediato)
         cache_duration = self.get_mpv_property("demuxer-cache-duration")
         if cache_duration:
             self.cache_duration = f"{cache_duration:.1f}s"
         
-        # Verifica se è in buffering
+        # Buffer status
+        old_buffer = self.buffer_status
         buffering = self.get_mpv_property("paused-for-cache")
         if buffering:
             self.buffer_status = "BUFFERING"
         else:
-            # Ottieni percentuale cache
             cache_percent = self.get_mpv_property("cache-buffering-state")
             if cache_percent is not None:
                 self.buffer_status = f"{cache_percent}%"
             else:
                 self.buffer_status = "OK"
+        
+        # Solo BUFFERING forza aggiornamento immediato
+        if old_buffer != "BUFFERING" and self.buffer_status == "BUFFERING":
+            changed = True
+        
+        if changed:
+            self.need_song_update = True
     
     def send_mpv_command(self, command, *args):
-        """Invia comando a MPV tramite IPC - cross-platform"""
+        """Invia comando a MPV tramite IPC"""
         try:
-            import json
-            
-            # Crea il comando JSON
-            cmd = {
-                "command": [command] + list(args)
-            }
+            cmd = {"command": [command] + list(args)}
             message = json.dumps(cmd) + "\n"
             
             if platform.system() == "Windows":
-                # Windows: usa named pipes
                 try:
                     import win32file
-                    
                     handle = win32file.CreateFile(
-                        self.mpv_socket,
-                        win32file.GENERIC_WRITE,
-                        0,
-                        None,
-                        win32file.OPEN_EXISTING,
-                        0,
-                        None
+                        self.mpv_socket, win32file.GENERIC_WRITE,
+                        0, None, win32file.OPEN_EXISTING, 0, None
                     )
-                    
                     win32file.WriteFile(handle, message.encode('utf-8'))
                     win32file.CloseHandle(handle)
                     return True
                 except ImportError:
                     return False
             else:
-                # Linux: usa socket Unix
                 if not os.path.exists(self.mpv_socket):
                     return False
                 
@@ -1007,66 +911,111 @@ class TerminalRadioPlayer:
                 sock.send(message.encode('utf-8'))
                 sock.close()
                 return True
-            
-        except Exception:
-            return False
-        """Invia comando a MPV tramite socket JSON IPC"""
-        if not os.path.exists(self.mpv_socket):
-            return False
-        
-        try:
-            import socket
-            import json
-            
-            # Crea il comando JSON
-            cmd = {
-                "command": [command] + list(args)
-            }
-            
-            # Connetti al socket
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(1.0)
-            sock.connect(self.mpv_socket)
-            
-            # Invia comando
-            message = json.dumps(cmd) + "\n"
-            sock.send(message.encode('utf-8'))
-            
-            sock.close()
-            return True
-            
         except Exception:
             return False
     
-    def change_volume(self, delta):
-        """Cambia il volume - usando comando MPV diretto"""
-        self.volume = max(0, min(100, self.volume + delta))
+    def toggle_play_pause(self):
+        """Avvia/pausa la riproduzione"""
+        if not self.stations:
+            return
         
-        # Invia comando di volume a MPV se sta suonando
-        if self.is_playing and self.mpv_process and self.mpv_process.poll() is None:
-            # Aspetta un po' che il socket sia pronto
-            time.sleep(0.1)
-            success = self.send_mpv_command("set_property", "volume", self.volume)
-            
-            if not success:
-                # Se il comando IPC fallisce, fallback al volume di sistema
+        if not self.is_playing:
+            self.play_selected_station()
+        else:
+            if self.playing_station_index != self.selected_station_index:
+                self.play_selected_station()
+            else:
+                if self.mpv_process and self.mpv_process.poll() is None:
+                    if self.is_paused:
+                        self.play_selected_station()
+                    else:
+                        if platform.system() != "Windows":
+                            os.killpg(os.getpgid(self.mpv_process.pid), signal.SIGSTOP)
+                        self.is_paused = True
+                        self.need_status_update = True
+                        self.need_stations_update = True
+    
+    def stop(self):
+        """Ferma la riproduzione"""
+        if self.mpv_process:
+            try:
+                if platform.system() == "Windows":
+                    self.mpv_process.terminate()
+                    self.mpv_process.wait(timeout=2)
+                else:
+                    os.killpg(os.getpgid(self.mpv_process.pid), signal.SIGTERM)
+                    self.mpv_process.wait(timeout=2)
+            except:
                 try:
-                    subprocess.run([
-                        'amixer', 'set', 'Master', f"{self.volume}%"
-                    ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if platform.system() == "Windows":
+                        self.mpv_process.kill()
+                    else:
+                        os.killpg(os.getpgid(self.mpv_process.pid), signal.SIGKILL)
                 except:
                     pass
+            self.mpv_process = None
+        
+        if platform.system() == "Linux" and os.path.exists(self.mpv_socket):
+            try:
+                os.remove(self.mpv_socket)
+            except:
+                pass
+        
+        # Reset stato
+        self.is_playing = False
+        self.is_paused = False
+        self.current_song = ""
+        self.current_artist = ""
+        self.stream_title = ""
+        self.bitrate = ""
+        self.start_time = None
+        self.playing_station_index = -1
+        self.audio_bitrate = ""
+        self.buffer_status = ""
+        self.audio_codec = ""
+        self.cache_duration = ""
+        self.current_song_start_time = None
+        self.pause_start_time = None
+        self.total_pause_time = 0
+        
+        # Marca aggiornamenti necessari
+        self.need_status_update = True
+        self.need_song_update = True
+        self.need_stations_update = True
     
-    def toggle_mute(self):
-        """Attiva/disattiva il muto - cross-platform"""
-        self.is_muted = not self.is_muted
+    def change_selection(self, direction):
+        """Cambia selezione"""
+        if not self.stations:
+            return
+        self.selected_station_index = (self.selected_station_index + direction) % len(self.stations)
+        self.need_stations_update = True
+    
+    def select_by_number(self, number):
+        """Seleziona stazione per numero"""
+        if not self.stations:
+            return
+        if 1 <= number <= len(self.stations):
+            self.selected_station_index = number - 1
+            self.need_stations_update = True
+    
+    def change_volume(self, delta):
+        """Cambia il volume"""
+        self.volume = max(0, min(100, self.volume + delta))
+        self.need_timer_update = True  # Il volume è mostrato nella riga timer
         
         if self.is_playing and self.mpv_process and self.mpv_process.poll() is None:
-            # Usa comando MPV per il muto
+            time.sleep(0.1)
+            self.send_mpv_command("set_property", "volume", self.volume)
+    
+    def toggle_mute(self):
+        """Attiva/disattiva il muto"""
+        self.is_muted = not self.is_muted
+        self.need_timer_update = True  # Il muto è mostrato nella riga timer
+        
+        if self.is_playing and self.mpv_process and self.mpv_process.poll() is None:
             success = self.send_mpv_command("set_property", "mute", self.is_muted)
             
             if not success and platform.system() != "Windows":
-                # Fallback ai segnali solo su Linux (Windows non supporta SIGSTOP/SIGCONT)
                 try:
                     if self.is_muted:
                         os.killpg(os.getpgid(self.mpv_process.pid), signal.SIGSTOP)
@@ -1076,16 +1025,15 @@ class TerminalRadioPlayer:
                     pass
     
     def handle_input(self):
-        """Gestisce l'input da tastiera - con aggiornamento su richiesta"""
+        """Gestisce l'input da tastiera"""
         while self.running:
             char = self.get_char()
             
             if char:
-                # Modalità inserimento numero
                 if self.number_input_mode:
                     if char.isdigit():
                         self.number_buffer += char
-                        self.force_update = True
+                        self.need_input_update = True
                     elif char == '\r' or char == '\n':
                         if self.number_buffer:
                             try:
@@ -1095,62 +1043,49 @@ class TerminalRadioPlayer:
                                 pass
                         self.number_input_mode = False
                         self.number_buffer = ""
-                        self.force_update = True
+                        self.need_input_update = True
                     elif char == 'ESC':
                         self.number_input_mode = False
                         self.number_buffer = ""
-                        self.force_update = True
+                        self.need_input_update = True
                     continue
                 
-                # Modalità normale
                 if char.lower() == 'q':
                     self.running = False
                 elif char.lower() == 'p' or char == ' ' or char == '\r' or char == '\n':
                     self.toggle_play_pause()
-                    self.force_update = True
                 elif char.lower() == 'm':
                     self.toggle_mute()
-                    self.force_update = True
                 elif char == '+' or char == '=':
                     self.change_volume(5)
-                    self.force_update = True
                 elif char == '-' or char == '_':
                     self.change_volume(-5)
-                    self.force_update = True
                 elif char == 'UP':
                     self.change_selection(-1)
-                    self.force_update = True
                 elif char == 'DOWN':
                     self.change_selection(1)
-                    self.force_update = True
                 elif char.lower() == 't':
-                    # Toggle notifiche cambio canzone
                     self.show_song_popups = not self.show_song_popups
-                    self.clear_screen()
-                    print()
+                    self.need_timer_update = True
+                    # Mostra messaggio temporaneo
+                    temp_line = self.NUMBER_INPUT_LINE - 1
                     if self.show_song_popups:
-                        print("🔔 Notifiche cambio canzone ATTIVATE")
-                        print("   Verranno mostrate le notifiche di sistema")
-                        print("   Premi 't' per disattivarle")
+                        self.update_line(temp_line, "🔔 Notifiche cambio canzone ATTIVATE")
                     else:
-                        print("🔔 Notifiche cambio canzone DISATTIVATE")
-                        print("   Premi 't' per riattivarle")
-                    print()
-                    time.sleep(2)
-                    self.force_update = True
+                        self.update_line(temp_line, "🔕 Notifiche cambio canzone DISATTIVATE")
+                    threading.Timer(2.0, lambda: self.update_line(temp_line, "")).start()
                 elif char.isdigit():
                     self.number_input_mode = True
                     self.number_buffer = char
-                    self.force_update = True
+                    self.need_input_update = True
             
             time.sleep(0.05)
     
     def run(self, m3u_file=None):
-        """Avvia il player"""
+        """Avvia il player con interfaccia a zero lampeggiamento"""
         try:
             self.setup_terminal()
             
-            # Carica file M3U
             if m3u_file:
                 if not self.load_m3u_file(m3u_file):
                     return
@@ -1160,24 +1095,33 @@ class TerminalRadioPlayer:
                     if not self.load_m3u_file(m3u_files[0]):
                         return
             
+            # Prima visualizzazione completa
+            self.need_full_redraw = True
             self.display_interface()
             
-            # Avvia il thread per gestire l'input
-            input_thread = threading.Thread(target=self.handle_input, daemon=True)
-            input_thread.start()
+            # Avvia thread input
+            threading.Thread(target=self.handle_input, daemon=True).start()
             
-            # Loop principale con aggiornamento automatico ogni 0.3 secondi
-            last_update = time.time()
+            # Loop principale ottimizzato - aggiorna solo timer ogni secondo
+            last_timer_update = 0
+            
             while self.running:
                 current_time = time.time()
                 
-                # Aggiorna l'interfaccia ogni 0.3 secondi o se forzato
-                if current_time - last_update >= 0.3 or self.force_update:
-                    self.display_interface()
-                    last_update = current_time
-                    self.force_update = False
+                # Aggiorna timer ogni secondo
+                if current_time - last_timer_update >= 1.0:
+                    self.need_timer_update = True
+                    last_timer_update = current_time
                 
-                time.sleep(0.1)  # Sleep breve per non consumare troppa CPU
+                # In riproduzione, aggiorna anche info brano ogni secondo (per il tempo)
+                if self.is_playing and current_time - last_timer_update < 0.1:  # Appena aggiornato il timer
+                    self.need_song_update = True
+                
+                # Esegui tutti gli aggiornamenti necessari
+                self.display_interface()
+                
+                # Sleep breve per responsività input
+                time.sleep(0.1)
                 
         except KeyboardInterrupt:
             pass
@@ -1189,16 +1133,9 @@ class TerminalRadioPlayer:
 
 def main():
     """Funzione principale"""
-    print("Radio Player M3U v1.0")
+    print("Radio Player M3U v2.0 - ZERO LAMPEGGIAMENTO")
     print("Copyright (C) 2025 Andres Zanzani <azanzani@gmail.com>")
-    print("Licensed under GPL 3 - https://www.gnu.org/licenses/gpl-3.0.html")
-    
-    # Mostra requisiti per sistema operativo
-    if platform.system() == "Windows":
-        print("Requisiti Windows: MPV, pywin32 (opzionale), win10toast (opzionale)")
-    else:
-        print("Requisiti Linux: MPV, notify-send/gdbus/zenity (per notifiche)")
-    
+    print("Aggiornamento parziale con ANSI escape sequences")
     print()
     
     m3u_file = None
@@ -1213,10 +1150,7 @@ def main():
         player.run(m3u_file)
     except Exception as e:
         print(f"❌ Errore: {e}")
-        if platform.system() == "Windows":
-            print("Suggerimento: Assicurati che MPV sia nel PATH o nella stessa cartella")
-        else:
-            print("Suggerimento: Installa MPV con 'sudo apt install mpv' (Ubuntu/Debian)")
+        print("Suggerimento: Assicurati che MPV sia installato")
 
 if __name__ == "__main__":
     main()
