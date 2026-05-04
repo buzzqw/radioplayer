@@ -16,12 +16,12 @@ Lettore di stazioni radio da terminale, **cross-platform** (Linux · macOS · Wi
 
 ```
 ╭──────────────────────────────────────────────────────────────────────────╮
-│ 🎵 RADIO PLAYER M3U    ⏰ 14:32:18    00:47    🔊 Volume: 80%  📝 ✗  🔔 │
+│ 🎵 RADIO PLAYER M3U    ⏰ 14:32:18    00:47    🔊 Volume: 80%  📝 ✗  🔔  │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ╭─ Status ─────────────────────────────────────────────────────────────────╮
 │ ▶  IN RIPRODUZIONE  │  📡 Radio Deejay                                   │
 │ 🎤 The Weeknd  🎼 Blinding Lights  [01:23]                               │
-│ 🔊 128 kbps • AAC • 📦 OK                                               │
+│ 🔊 128 kbps • AAC • 📦 OK                                                │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ╭─ 📻 Stazioni (9 totali) ─────────────────────────────────────────────────╮
 │       1  IT::Venice Radio                                                │
@@ -35,8 +35,8 @@ Lettore di stazioni radio da terminale, **cross-platform** (Linux · macOS · Wi
 │       9  IT::Radio Classica CH                                           │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ╭─ 🎮 Controlli ───────────────────────────────────────────────────────────╮
-│ ↑/↓ Seleziona  p/Space Play/Pausa  +/= Vol+  -/_ Vol-  m Muto  b Sfoglia│
-│ r Rec  l Log  t Notifiche  h Cronologia  s Salva  1-9+↵ Vai a #  q Esci │
+│ ↑/↓ Seleziona  p/Space Play/Pausa  +/= Vol+  -/_ Vol-  m Muto  b Sfoglia │
+│ r Rec  l Log  t Notifiche  h Cronologia  s Salva  1-9+↵ Vai a #  q Esci  │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -44,13 +44,13 @@ Lettore di stazioni radio da terminale, **cross-platform** (Linux · macOS · Wi
 
 ```
 ╭──────────────────────────────────────────────────────────────────────────╮
-│ 🎵 RADIO PLAYER M3U    ⏰ 14:33:05    01:34    🔊 Volume: 80%  📝 ✗  🔔 │
+│ 🎵 RADIO PLAYER M3U    ⏰ 14:33:05    01:34    🔊 Volume: 80%  📝 ✗  🔔  │
 ╰──────────────────────────────────────────────────────────────────────────╯
-╭─ 🔍 RadioBrowser.info  ✅ 20 stazioni trovate ──────────────────────────╮
+╭─ 🔍 RadioBrowser.info  ✅ 20 stazioni trovate ───────────────────────────╮
 │ radio italia_                                                            │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ╭─ Risultati (20) ─────────────────────────────────────────────────────────╮
-│    Nome                           Paese   kbps  Codec  ★ Voti           │
+│    Nome                           Paese   kbps  Codec  ★ Voti            │
 │ 👉 Virgin Radio Italia            Italy    128  MP3    16116             │
 │    Radio Italia Solo Musica       Italy      0  MP3     9276             │
 │    CLASSIC HITS RADIO Italia      Italy    192  AAC     5844             │
@@ -58,7 +58,7 @@ Lettore di stazioni radio da terminale, **cross-platform** (Linux · macOS · Wi
 │    Radio Italia Anni 60           Italy     64  MP3     2998             │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ╭─ 🎮 Comandi ricerca ─────────────────────────────────────────────────────╮
-│ ↑/↓ Naviga  ↵ Aggiungi a M3U  p Ascolta anteprima  ⌫ Cancella  Esc Torna│
+│ ↑/↓ Naviga  ↵ Aggiungi a M3U  p Ascolta anteprima  ⌫ Cancella  Esc Torna │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ```
 
