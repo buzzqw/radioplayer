@@ -1,15 +1,12 @@
 # Radio Player M3U - Requirements
 # Python 3.8+
 
-# Core dependencies
-requests>=2.31.0
+# Interfaccia TUI avanzata (fortemente consigliata)
 rich>=13.7.0
 
-# Optional dependencies for Windows notifications
-# Uncomment if on Windows:
+# HTTP per metadati ICY (Shoutcast/Icecast)
+requests>=2.31.0
+
+# Notifiche desktop su Windows (opzionale)
 # win10toast>=0.9
 # pywin32>=306
-
-# Development/Testing (optional)
-# pytest>=7.4.0
-# pytest-cov>=4.1.0

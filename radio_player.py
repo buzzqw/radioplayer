@@ -33,6 +33,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, Future
 from enum import Flag, auto
 import queue
+import threading
 from collections import deque
 
 # Rich UI imports (con fallback)
@@ -448,86 +449,191 @@ class MPVIPCClient:
 
 class MetadataMonitor:
     """Monitora i metadata dello stream radio"""
-    
+
     def __init__(self, update_callback):
         self.update_callback = update_callback
         self.running = False
         self.current_url = None
+        self._response = None  # risposta HTTP attiva, chiudibile da stop()
         logger.info("Inizializzato MetadataMonitor")
-    
+
     def start(self, url: str):
-        """Avvia il monitoraggio dei metadata"""
         self.current_url = url
         self.running = True
         logger.info(f"Avviato monitoraggio metadata per: {url}")
-    
+
     def stop(self):
-        """Ferma il monitoraggio"""
         self.running = False
         self.current_url = None
+        # Chiude la connessione attiva: interrompe il read() bloccante nel thread
+        resp = self._response
+        if resp is not None:
+            self._response = None
+            try:
+                resp.close()
+            except Exception:
+                pass
         logger.info("Fermato monitoraggio metadata")
-    
+
     def monitor_loop(self):
         """Loop di monitoraggio metadata ICY"""
         while self.running and self.current_url:
+            resp = None
             try:
-                headers = {
-                    'Icy-MetaData': '1',
-                    'User-Agent': 'RadioPlayer/2.0'
-                }
-                
-                with requests.get(self.current_url, headers=headers, 
-                                stream=True, timeout=5) as response:
-                    
-                    # Estrai bitrate ICY
-                    icy_bitrate = response.headers.get('icy-br', '')
-                    if icy_bitrate:
-                        self.update_callback('bitrate', f"{icy_bitrate} kbps")
-                    
-                    # Estrai metaint
-                    metaint = response.headers.get('icy-metaint')
-                    if not metaint:
-                        logger.debug("Nessun icy-metaint, attendo...")
-                        time.sleep(5)
-                        continue
-                    
-                    metaint = int(metaint)
-                    logger.debug(f"ICY metaint: {metaint}")
-                    
-                    while self.running:
-                        # Leggi chunk audio
-                        audio_data = response.raw.read(metaint)
+                headers = {'Icy-MetaData': '1', 'User-Agent': 'RadioPlayer/2.0'}
+                resp = requests.get(
+                    self.current_url, headers=headers, stream=True, timeout=5
+                )
+                self._response = resp
+
+                icy_bitrate = resp.headers.get('icy-br', '')
+                if icy_bitrate:
+                    self.update_callback('bitrate', f"{icy_bitrate} kbps")
+
+                metaint = resp.headers.get('icy-metaint')
+                if not metaint:
+                    logger.debug("Nessun icy-metaint, attendo...")
+                    time.sleep(5)
+                    continue
+
+                metaint = int(metaint)
+                logger.debug(f"ICY metaint: {metaint}")
+
+                while self.running:
+                    try:
+                        audio_data = resp.raw.read(metaint)
                         if not audio_data:
                             break
-                        
-                        # Leggi lunghezza metadata
-                        meta_length_byte = response.raw.read(1)
+
+                        meta_length_byte = resp.raw.read(1)
                         if not meta_length_byte:
                             break
-                        
+
                         meta_length = ord(meta_length_byte) * 16
-                        
+
                         if meta_length > 0:
-                            # Leggi metadata
-                            metadata = response.raw.read(meta_length)
+                            metadata = resp.raw.read(meta_length)
                             metadata_str = metadata.decode('utf-8', errors='ignore')
-                            
-                            # Estrai StreamTitle
                             title_match = re.search(r"StreamTitle='([^']*)'", metadata_str)
                             if title_match:
                                 stream_title = title_match.group(1).strip()
                                 if stream_title:
                                     self.update_callback('stream_title', stream_title)
                                     logger.info(f"Metadata ICY: {stream_title}")
-                
+                    except Exception:
+                        # Connessione chiusa da stop() o errore di rete
+                        break
+
             except requests.RequestException as e:
-                logger.warning(f"Errore richiesta metadata: {e}")
-                time.sleep(5)
+                if self.running:
+                    logger.warning(f"Errore richiesta metadata: {e}")
+                    time.sleep(5)
             except Exception as e:
-                logger.error(f"Errore monitor metadata: {e}", exc_info=True)
-                time.sleep(5)
-        
+                if self.running:
+                    logger.error(f"Errore monitor metadata: {e}", exc_info=True)
+                    time.sleep(5)
+            finally:
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                self._response = None
+
         logger.info("Loop metadata terminato")
+
+# ============================================================================
+# CLIENT RADIOBROWSER.INFO
+# ============================================================================
+
+class RadioBrowserAPI:
+    """Client per la API pubblica RadioBrowser.info"""
+
+    _BASE_URLS = [
+        "https://all.api.radio-browser.info/json",
+        "http://all.api.radio-browser.info/json",
+    ]
+    HEADERS = {"User-Agent": "RadioPlayerM3U/2.0 azanzani@gmail.com"}
+    _working_base: Optional[str] = None  # cache classe: evita retry SSL ad ogni ricerca
+
+    def _get(self, path: str, params: dict) -> Optional[Any]:
+        """Tenta la richiesta su tutti gli endpoint, cachando quello funzionante."""
+        import urllib3
+
+        # Metti in cima l'URL già funzionante, se noto
+        bases = []
+        if self._working_base:
+            bases.append(self._working_base)
+        bases += [b for b in self._BASE_URLS if b != self._working_base]
+
+        for base in bases:
+            for verify in (True, False):
+                if not verify:
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                try:
+                    resp = requests.get(
+                        f"{base}{path}",
+                        params=params,
+                        headers=self.HEADERS,
+                        timeout=8,
+                        verify=verify,
+                    )
+                    resp.raise_for_status()
+                    RadioBrowserAPI._working_base = base  # salva per le prossime chiamate
+                    return resp.json()
+                except requests.exceptions.SSLError:
+                    if verify:
+                        continue  # riprova senza verifica SSL
+                    break  # passa all'endpoint successivo
+                except requests.Timeout:
+                    logger.warning(f"RadioBrowser: timeout su {base}")
+                    break
+                except Exception as e:
+                    logger.warning(f"RadioBrowser: {base} (verify={verify}) — {e}")
+                    break
+        return None
+
+    def search(self, query: str, limit: int = 20) -> List["RadioStation"]:
+        """Cerca stazioni per nome. Restituisce lista ordinata per popolarità."""
+        if not query.strip():
+            return []
+
+        params = {
+            "name": query,
+            "limit": limit,
+            "hidebroken": "true",
+            "order": "votes",
+            "reverse": "true",
+        }
+        data = self._get("/stations/search", params)
+        if data is None:
+            return []
+
+        results: List[RadioStation] = []
+        for item in data:
+            url = item.get("url_resolved") or item.get("url", "")
+            if not url or not M3UParser.is_valid_url(url):
+                continue
+            station = RadioStation(
+                name=item.get("name", "Unknown").strip(),
+                url=url,
+                metadata={
+                    "title":       item.get("name", "").strip(),
+                    "group-title": item.get("country", ""),
+                    "tvg-logo":    item.get("favicon", ""),
+                    "rb-uuid":     item.get("stationuuid", ""),
+                    "rb-votes":    str(item.get("votes", 0)),
+                    "rb-bitrate":  str(item.get("bitrate", 0)),
+                    "rb-codec":    item.get("codec", ""),
+                    "rb-country":  item.get("country", ""),
+                    "rb-tags":     item.get("tags", ""),
+                },
+            )
+            results.append(station)
+
+        logger.info(f"RadioBrowser: {len(results)} stazioni per '{query}'")
+        return results
+
 
 # ============================================================================
 # CONTROLLER MPV
@@ -687,7 +793,7 @@ class RadioPlayer:
         self.history = MetadataHistory()
         
         # Thread pool
-        self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="RadioPlayer")
+        self.executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="RadioPlayer")
         self.update_queue: queue.Queue = queue.Queue()
         
         # UI
@@ -713,10 +819,25 @@ class RadioPlayer:
         
         # Logging
         self.logging_enabled = False  # Default OFF
-        
+
         # Messaggio temporaneo UI
         self.temp_message = ""
         self.temp_message_time = 0
+
+        # RadioBrowser search
+        self.radio_browser = RadioBrowserAPI()
+        self.search_mode = False
+        self.search_query = ""
+        self.search_results: List[RadioStation] = []
+        self.search_selected_idx = 0
+        self.search_loading = False
+        self._search_timer: Optional[threading.Timer] = None
+        self._last_searched_query = ""   # query dell'ultima ricerca completata
+        self._preview_station: Optional[RadioStation] = None  # in ascolto ma non in M3U
+        self.m3u_file_path: Optional[Path] = None
+
+        # Timer sessione: non si resetta al cambio stazione
+        self.session_start_time = time.time()
         
         # Cache UI
         self.last_render_time = 0
@@ -752,12 +873,13 @@ class RadioPlayer:
         try:
             parser = M3UParser()
             self.stations = parser.parse_file(file_path)
-            
+
             if not self.stations:
                 logger.warning("Nessuna stazione trovata nel file M3U")
                 return False
-            
-            logger.info(f"Caricate {len(self.stations)} stazioni")
+
+            self.m3u_file_path = file_path
+            logger.info(f"Caricate {len(self.stations)} stazioni da {file_path}")
             self.pending_updates |= UpdateFlags.FULL
             return True
             
@@ -939,7 +1061,8 @@ class RadioPlayer:
             self.state.is_paused = False
             self.state.playing_station_index = -1
             self.state.stream_info = StreamInfo()
-            
+            self._preview_station = None
+
             self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG | UpdateFlags.STATIONS
     
     def toggle_play_pause(self):
@@ -1165,6 +1288,130 @@ class RadioPlayer:
         self.show_temp_message(msg)
         logger.info(msg)
     
+    # ========================================================================
+    # RICERCA RADIOBROWSER
+    # ========================================================================
+
+    def enter_search_mode(self):
+        """Entra in modalità sfoglia RadioBrowser.info"""
+        self.search_mode = True
+        self.search_query = ""
+        self.search_results = []
+        self.search_selected_idx = 0
+        self.search_loading = False
+        self.pending_updates |= UpdateFlags.FULL
+        logger.info("Entrato in modalità ricerca RadioBrowser")
+
+    def exit_search_mode(self):
+        """Esce dalla modalità ricerca"""
+        if self._search_timer:
+            self._search_timer.cancel()
+            self._search_timer = None
+        self.search_mode = False
+        self.pending_updates |= UpdateFlags.FULL
+        logger.info("Uscito dalla modalità ricerca")
+
+    def _trigger_search(self):
+        """Avvia ricerca con debounce di 0.5s"""
+        if self._search_timer:
+            self._search_timer.cancel()
+            self._search_timer = None
+
+        if not self.search_query.strip():
+            self.search_results = []
+            self.search_selected_idx = 0
+            self.search_loading = False
+            self.pending_updates |= UpdateFlags.STATIONS
+            return
+
+        self.search_loading = True
+        self.pending_updates |= UpdateFlags.STATIONS
+        self._search_timer = threading.Timer(0.3, self._do_search)
+        self._search_timer.daemon = True
+        self._search_timer.start()
+
+    def _do_search(self):
+        """Esegue la chiamata API in background"""
+        query = self.search_query
+        if not query.strip():
+            return
+        try:
+            results = self.radio_browser.search(query)
+            if query == self.search_query:  # query non cambiata durante la ricerca
+                self.search_results = results
+                self.search_selected_idx = 0
+                self.search_loading = False
+                self._last_searched_query = query  # memorizza per il messaggio "nessun risultato"
+                self.pending_updates |= UpdateFlags.STATIONS
+        except Exception as e:
+            logger.error(f"Errore ricerca: {e}")
+            self.search_loading = False
+            self._last_searched_query = query
+            self.pending_updates |= UpdateFlags.STATIONS
+
+    def play_preview(self, station: RadioStation):
+        """Ascolta anteprima senza aggiungere al M3U"""
+        self.stop()
+        if self.mpv_controller.start(station.url, self.state.volume):
+            self.state.is_playing = True
+            self.state.is_paused = False
+            self.state.playing_station_index = -1
+            self._preview_station = station
+            self.state.stream_info = StreamInfo(
+                start_time=time.time(),
+                song_start_time=time.time(),
+            )
+            self.metadata_monitor.start(station.url)
+            self.executor.submit(self.metadata_monitor.monitor_loop)
+            self.executor.submit(self._stats_monitor_loop)
+            self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG
+            self.show_temp_message(f"👂 Anteprima: {station.name}")
+            logger.info(f"Preview: {station.name}")
+        else:
+            self.show_temp_message("❌ Impossibile avviare anteprima")
+
+    def add_station_to_m3u(self, station: RadioStation) -> bool:
+        """Aggiunge la stazione al file M3U evitando duplicati (URL e nome)"""
+        if not self.m3u_file_path:
+            self.show_temp_message("❌ Nessun file M3U caricato")
+            return False
+
+        # Controllo duplicato per URL (normalizzato senza trailing slash)
+        station_url = station.url.rstrip("/")
+        for existing in self.stations:
+            if existing.url.rstrip("/") == station_url:
+                self.show_temp_message(f"⚠️  Già presente: {existing.name}")
+                return False
+
+        # Controllo duplicato per nome (case-insensitive)
+        station_name_lc = station.name.strip().lower()
+        for existing in self.stations:
+            if existing.name.strip().lower() == station_name_lc:
+                self.show_temp_message(f"⚠️  Nome già presente: {existing.name}")
+                return False
+
+        try:
+            try:
+                content = self.m3u_file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                content = self.m3u_file_path.read_text(encoding="latin-1")
+
+            with open(self.m3u_file_path, "a", encoding="utf-8") as f:
+                if content and not content.endswith("\n"):
+                    f.write("\n")
+                f.write(f"#EXTINF:-1,{station.name}\n{station.url}\n")
+
+            self.stations.append(station)
+            self.pending_updates |= UpdateFlags.STATIONS
+            self.show_temp_message(f"✅ Aggiunta: {station.name}")
+            logger.info(f"Aggiunta al M3U: {station.name} — {station.url}")
+            return True
+
+        except Exception as e:
+            self.show_temp_message(f"❌ Errore salvataggio: {e}")
+            logger.error(f"Errore aggiunta stazione: {e}")
+            return False
+
     def _stats_monitor_loop(self):
         """Loop monitoraggio statistiche MPV e METADATA"""
         logger.info("Avviato monitor statistiche")
@@ -1236,18 +1483,17 @@ class RadioPlayer:
         """Costruisce il layout Rich"""
         if not RICH_AVAILABLE:
             return None
-        
+
         layout = Layout()
-        
-        # FIX UI: Aumentato size da 4 a 6 per garantire spazio al titolo brano
+
+        # stations size=12: 10 stazioni + 2 bordi pannello sempre visibili
         layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="status", size=6), 
-            Layout(name="stations", ratio=2),
-            Layout(name="controls", size=8),
-            Layout(name="footer", size=1)
+            Layout(name="status", size=5),
+            Layout(name="stations", size=12),
+            Layout(name="controls", ratio=1),
         )
-        
+
         return layout
     
     def _render_rich_header(self) -> Optional[Any]:
@@ -1256,9 +1502,13 @@ class RadioPlayer:
             return None
         
         current_time = datetime.now().strftime("%H:%M:%S")
-        uptime = self.state.stream_info.get_uptime(
-            self.state.is_playing, self.state.is_paused
-        )
+
+        # Uptime di sessione: calcolato da session_start_time, mai resettato
+        elapsed = time.time() - self.session_start_time
+        h = int(elapsed // 3600)
+        m = int((elapsed % 3600) // 60)
+        s = int(elapsed % 60)
+        uptime = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
         
         volume_icon = "🔇" if self.state.is_muted else "🔊"
         notif_icon = "🔔" if self.state.show_song_popups else "🔕"
@@ -1277,164 +1527,136 @@ class RadioPlayer:
         return Panel(header_text, border_style="cyan")
     
     def _render_rich_status(self) -> Optional[Any]:
-        """Renderizza status Rich"""
+        """Renderizza status Rich (3 righe di contenuto, size=5)"""
         if not RICH_AVAILABLE:
             return None
-        if self.state.is_playing and not self.state.is_paused:
-            status_icon = "▶️"
-            status_text = "IN RIPRODUZIONE"
-            status_style = "green"
-        elif self.state.is_paused:
-            status_icon = "⏸️"
-            status_text = "IN PAUSA"
-            status_style = "yellow"
-        else:
-            status_icon = "⏹️"
-            status_text = "FERMATO"
-            status_style = "red"
-        
-        lines = []
-        lines.append(f"[bold {status_style}]{status_icon} {status_text}[/bold {status_style}]")
-        
-        # Info brano - SEMPRE VISIBILE SE CI SONO
-        # NOTA: Spostate SOPRA il nome della stazione per evitare che vengano tagliate
-        if self.state.stream_info.artist and self.state.stream_info.song:
-            lines.append(f"[magenta]🎤 {self.state.stream_info.artist}[/magenta]")
-            song_time = self.state.stream_info.get_song_time(
-                self.state.is_playing, self.state.is_paused
-            )
-            lines.append(f"[bold blue]🎼 {self.state.stream_info.song}[/bold blue] [yellow][{song_time}][/yellow]")
-            
-        elif self.state.stream_info.song:
-            song_time = self.state.stream_info.get_song_time(
-                self.state.is_playing, self.state.is_paused
-            )
-            if song_time != "00:00":
-                lines.append(f"[bold blue]🎼 {self.state.stream_info.song}[/bold blue] [yellow][{song_time}][/yellow]")
-            else:
-                lines.append(f"[bold blue]🎼 {self.state.stream_info.song}[/bold blue]")
-                
-        elif self.state.stream_info.title:
-            lines.append(f"[bold blue]🎼 {self.state.stream_info.title}[/bold blue]")
-            
-        elif self.state.is_playing:
-            lines.append("[dim italic]🎼 In attesa dei metadata dello stream...[/dim italic]")
 
-        # Aggiungi indicatore registrazione
-        if self.is_recording:
-            lines.append("[bold red]  🔴 REGISTRAZIONE IN CORSO[/bold red]")
-        
+        si = self.state.stream_info
+
+        # Riga 1: stato + stazione + registrazione
+        if self.state.is_playing and not self.state.is_paused:
+            status_part = "[bold green]▶  IN RIPRODUZIONE[/bold green]"
+        elif self.state.is_paused:
+            status_part = "[bold yellow]⏸  IN PAUSA[/bold yellow]"
+        else:
+            status_part = "[bold red]⏹  FERMATO[/bold red]"
+
+        station_part = ""
         if self.state.playing_station_index >= 0:
             station = self.stations[self.state.playing_station_index]
-            lines.append(f"[cyan]📡 {station.name}[/cyan]")
-        
-        # Messaggio temporaneo DOPO le info brano
+            station_part = f"  [dim]│[/dim]  [cyan]📡 {station.name}[/cyan]"
+        elif self._preview_station:
+            station_part = f"  [dim]│[/dim]  [magenta]👂 {self._preview_station.name} (anteprima)[/magenta]"
+
+        rec_part = "  [bold red]🔴 REC[/bold red]" if self.is_recording else ""
+        line1 = f"{status_part}{station_part}{rec_part}"
+
+        # Riga 2: info brano
+        if si.artist and si.song:
+            song_time = si.get_song_time(self.state.is_playing, self.state.is_paused)
+            time_str = f" [yellow][{song_time}][/yellow]" if song_time != "00:00" else ""
+            line2 = f"[magenta]🎤 {si.artist}[/magenta]  [bold blue]🎼 {si.song}[/bold blue]{time_str}"
+        elif si.song or si.title:
+            song = si.song or si.title
+            song_time = si.get_song_time(self.state.is_playing, self.state.is_paused)
+            time_str = f" [yellow][{song_time}][/yellow]" if song_time != "00:00" else ""
+            line2 = f"[bold blue]🎼 {song}[/bold blue]{time_str}"
+        elif self.state.is_playing:
+            line2 = "[dim italic]🎼 In attesa dei metadata dello stream...[/dim italic]"
+        else:
+            line2 = ""
+
+        # Riga 3: messaggio temporaneo oppure info tecniche
         if self.temp_message and (time.time() - self.temp_message_time) < 2:
-            lines.append(f"[yellow]💬 {self.temp_message}[/yellow]")
-        
-        # Info tecniche
-        tech_info = []
-        if self.state.stream_info.audio_bitrate:
-            tech_info.append(f"🔊 {self.state.stream_info.audio_bitrate}")
-        elif self.state.stream_info.bitrate:
-            tech_info.append(f"🔊 {self.state.stream_info.bitrate}")
-        if self.state.stream_info.codec:
-            tech_info.append(self.state.stream_info.codec)
-        if self.state.stream_info.buffer_status:
-            if self.state.stream_info.buffer_status == "BUFFERING":
-                tech_info.append(f"🔄 {self.state.stream_info.buffer_status}")
-            else:
-                tech_info.append(f"📦 {self.state.stream_info.buffer_status}")
-        
-        if tech_info:
-            lines.append(f"[dim]{' • '.join(tech_info)}[/dim]")
-        
-        content_str = "\n".join(lines)
-        return Panel(content_str, title="Status", border_style="green")
+            line3 = f"[yellow]💬 {self.temp_message}[/yellow]"
+        else:
+            tech = []
+            if si.audio_bitrate or si.bitrate:
+                tech.append(f"🔊 {si.audio_bitrate or si.bitrate}")
+            if si.codec:
+                tech.append(si.codec)
+            if si.buffer_status:
+                if si.buffer_status == "BUFFERING":
+                    tech.append("[bold red]🔄 BUFFERING[/bold red]")
+                else:
+                    tech.append(f"📦 {si.buffer_status}")
+            line3 = f"[dim]{' • '.join(tech)}[/dim]" if tech else ""
+
+        parts = [line1]
+        if line2:
+            parts.append(line2)
+        if line3:
+            parts.append(line3)
+
+        return Panel("\n".join(parts), title="Status", border_style="green")
     
     def _render_rich_stations(self) -> Optional[Any]:
-        """Renderizza lista stazioni Rich"""
+        """Renderizza lista stazioni Rich (sempre 10 righe, size=12)"""
         if not RICH_AVAILABLE:
             return None
-        
+
+        n_visible = 10
+        n_stations = len(self.stations)
+
+        # Centra la finestra sulla stazione selezionata
+        start_idx = max(0, self.state.selected_station_index - n_visible // 2)
+        if start_idx + n_visible > n_stations:
+            start_idx = max(0, n_stations - n_visible)
+        end_idx = min(n_stations, start_idx + n_visible)
+
         table = Table(show_header=False, box=None, padding=(0, 1))
         table.add_column("Marker", style="cyan", width=4, no_wrap=True)
         table.add_column("Number", style="yellow", width=3, no_wrap=True)
         table.add_column("Name", style="white")
-        
-        # Mostra 10 stazioni centrate sulla selezione
-        start_idx = max(0, self.state.selected_station_index - 5)
-        end_idx = min(len(self.stations), start_idx + 10)
-        
-        if start_idx > 0:
-            table.add_row("", "...", "⬆️  Altre stazioni sopra")
-        
+
         for i in range(start_idx, end_idx):
             station = self.stations[i]
-            
-            # Marker con larghezza fissa (4 caratteri totali)
-            # Formato: "XX  " dove XX può essere: "👉", "▶️", "⏸️", "  "
-            marker = ""
-            
-            # Prima parte: selezione (2 char)
-            if i == self.state.selected_station_index:
-                marker += "👉"
-            else:
-                marker += "  "
-            
-            # Seconda parte: play status (2 char)  
+
+            marker = "👉" if i == self.state.selected_station_index else "  "
+
             if i == self.state.playing_station_index and self.state.is_playing:
-                if not self.state.is_paused:
-                    marker += "▶️"
-                else:
-                    marker += "⏸️"
+                marker += "▶️" if not self.state.is_paused else "⏸️"
             else:
                 marker += "  "
-            
-            # Applica stile inversione solo se selezionata
+
             style = "bold reverse" if i == self.state.selected_station_index else ""
-            
             table.add_row(marker, str(i + 1), station.name, style=style)
-        
-        if end_idx < len(self.stations):
-            table.add_row("", "...", "⬇️  Altre stazioni sotto")
-        
-        return Panel(table, title=f"📻 Stazioni ({len(self.stations)} totali)", 
-                    border_style="blue")
+
+        title = f"📻 Stazioni ({n_stations} totali)"
+        if n_stations > n_visible:
+            title += f"  [{start_idx + 1}–{end_idx} di {n_stations}]"
+
+        return Panel(table, title=title, border_style="blue")
     
     def _render_rich_controls(self) -> Optional[Any]:
-        """Renderizza controlli Rich"""
+        """Renderizza controlli Rich (2 righe compatte + eventuale input numero)"""
         if not RICH_AVAILABLE:
             return None
-        
-        # Uso padding esplicito con spazi per allineamento
-        controls = [
-            ("↑/↓          ", "Seleziona stazione    ", "+/=           ", "Alza volume"),
-            ("p/Spazio     ", "Play/Pausa            ", "-/_           ", "Abbassa volume"),
-            ("m            ", "Muto/Riattiva         ", "1-9+Invio     ", "Vai a numero"),
-            ("r            ", "Rec ON/OFF            ", "l             ", "Log ON/OFF"),
-            ("t            ", "Toggle notifiche      ", "h             ", "Cronologia brani"),
-            ("s            ", "Salva cronologia      ", "q             ", "Esci")
+
+        lines = [
+            "[cyan]↑/↓[/cyan] Seleziona  "
+            "[cyan]p/Space[/cyan] Play/Pausa  "
+            "[cyan]+/=[/cyan] Vol+  "
+            "[cyan]-/_[/cyan] Vol-  "
+            "[cyan]m[/cyan] Muto  "
+            "[cyan]b[/cyan] Sfoglia RadioBrowser",
+
+            "[cyan]r[/cyan] Rec  "
+            "[cyan]l[/cyan] Log  "
+            "[cyan]t[/cyan] Notifiche  "
+            "[cyan]h[/cyan] Cronologia  "
+            "[cyan]s[/cyan] Salva  "
+            "[cyan]1-9+↵[/cyan] Vai a #  "
+            "[cyan]q[/cyan] Esci",
         ]
-        
-        table = Table(show_header=False, box=None, padding=(0, 1))
-        table.add_column(justify="left", no_wrap=True, style="cyan")
-        table.add_column(justify="left", no_wrap=True)
-        table.add_column(justify="left", no_wrap=True, style="cyan")
-        table.add_column(justify="left", no_wrap=True)
-        
-        for left_key, left_desc, right_key, right_desc in controls:
-            table.add_row(left_key, left_desc, right_key, right_desc)
-        
-        # Input numerico
+
         if self.number_input_mode:
-            input_text = Text()
-            input_text.append("🔢 INSERISCI NUMERO: ", style="bold yellow")
-            input_text.append(f"{self.number_buffer}_", style="bold white")
-            input_text.append(" (Invio=conferma, Esc=annulla)", style="dim")
-            table.add_row(input_text, "", "", "")
-        
-        return Panel(table, title="🎮 Controlli", border_style="yellow")
+            lines.append(
+                f"[bold yellow]🔢 NUMERO: {self.number_buffer}_[/bold yellow]"
+                "  [dim](↵=conferma  Esc=annulla)[/dim]"
+            )
+
+        return Panel("\n".join(lines), title="🎮 Controlli", border_style="yellow")
     
     def _render_rich_footer(self) -> Optional[Any]:
         """Renderizza footer Rich"""
@@ -1447,19 +1669,124 @@ class RadioPlayer:
         footer.append(" - GPL 3 License", style="dim")
         return footer
     
+    def _render_rich_search(self) -> Optional[Any]:
+        """Renderizza il pannello di ricerca RadioBrowser.info"""
+        if not RICH_AVAILABLE:
+            return None
+
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="search_input", size=3),
+            Layout(name="search_results", ratio=1),
+            Layout(name="search_controls", size=4),
+        )
+
+        layout["header"].update(self._render_rich_header())
+
+        # --- Stato corrente: determina titoli e colori ---
+        spinner = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")[int(time.time() * 8) % 10]
+        cursor  = "_" if int(time.time() * 2) % 2 == 0 else " "
+
+        if self.search_loading:
+            input_title   = f"🔍 RadioBrowser.info  [bold yellow]{spinner} RICERCA IN CORSO...[/bold yellow]"
+            input_border  = "yellow"
+            res_title     = f"[bold yellow]{spinner} Ricerca in corso...[/bold yellow]"
+            res_border    = "yellow"
+            res_body      = (
+                f"\n[bold yellow]{spinner}  Interrogazione RadioBrowser.info...[/bold yellow]\n\n"
+                f'[dim]Cerca: "[italic]{self.search_query}[/italic]"[/dim]'
+            )
+        elif self.search_results:
+            input_title   = f"🔍 RadioBrowser.info  [bold green]✅ {len(self.search_results)} stazioni trovate[/bold green]"
+            input_border  = "green"
+            n             = len(self.search_results)
+            res_title     = f"Risultati ({n})"
+            res_border    = "green"
+            res_body      = None  # usa la tabella
+        elif self._last_searched_query:
+            input_title   = f'🔍 RadioBrowser.info  [bold red]❌ Nessun risultato per "{self._last_searched_query}"[/bold red]'
+            input_border  = "red"
+            res_title     = "Risultati"
+            res_border    = "red"
+            res_body      = f'[bold red]❌  Nessuna stazione trovata per "[italic]{self._last_searched_query}[/italic]"[/bold red]\n\n[dim]Prova con termini diversi (es. solo il nome, senza prefisso paese)[/dim]'
+        else:
+            input_title   = "🔍 RadioBrowser.info — sfoglia 40.000+ stazioni"
+            input_border  = "magenta"
+            res_title     = "Risultati"
+            res_border    = "magenta"
+            res_body      = "[dim italic]Inizia a digitare il nome della stazione...[/dim italic]"
+
+        # --- Barra di ricerca ---
+        input_content = f"[bold white]{self.search_query}{cursor}[/bold white]"
+        layout["search_input"].update(
+            Panel(input_content, title=input_title, border_style=input_border)
+        )
+
+        # --- Lista risultati ---
+        if self.search_results and not self.search_loading:
+            table = Table(show_header=True, box=None, padding=(0, 1))
+            table.add_column("", width=2, no_wrap=True)
+            table.add_column("Nome", style="white", ratio=3)
+            table.add_column("Paese", style="cyan", width=6, no_wrap=True)
+            table.add_column("kbps", style="yellow", width=6, no_wrap=True, justify="right")
+            table.add_column("Codec", style="dim", width=6, no_wrap=True)
+            table.add_column("★ Voti", style="green", width=8, no_wrap=True, justify="right")
+
+            n_visible = 15
+            start = max(0, self.search_selected_idx - n_visible // 2)
+            if start + n_visible > len(self.search_results):
+                start = max(0, len(self.search_results) - n_visible)
+            end = min(len(self.search_results), start + n_visible)
+
+            for i in range(start, end):
+                s = self.search_results[i]
+                marker  = "👉" if i == self.search_selected_idx else "  "
+                already = any(e.url.rstrip("/") == s.url.rstrip("/") for e in self.stations)
+                name    = f"[dim]{s.name} ✓[/dim]" if already else s.name
+                country = s.metadata.get("rb-country", "")[:5]
+                bitrate = s.metadata.get("rb-bitrate", "0")
+                codec   = s.metadata.get("rb-codec", "")[:6]
+                votes   = s.metadata.get("rb-votes", "0")
+                style   = "bold reverse" if i == self.search_selected_idx else ""
+                table.add_row(marker, name, country, bitrate, codec, votes, style=style)
+
+            if len(self.search_results) > n_visible:
+                res_title += f"  [{start + 1}–{end}]"
+
+            layout["search_results"].update(Panel(table, title=res_title, border_style=res_border))
+        else:
+            layout["search_results"].update(Panel(res_body, title=res_title, border_style=res_border))
+
+        # --- Controlli contestuali ---
+        preview_stop = "  [cyan]Space[/cyan] Ferma anteprima" if self.state.is_playing else ""
+        ctrl = (
+            "[cyan]↑/↓[/cyan] Naviga  "
+            "[cyan]↵[/cyan] Aggiungi a M3U  "
+            "[cyan]p[/cyan] Ascolta anteprima"
+            f"{preview_stop}  "
+            "[cyan]⌫[/cyan] Cancella  "
+            "[cyan]Esc[/cyan] Torna alla lista"
+        )
+        layout["search_controls"].update(Panel(ctrl, title="🎮 Comandi ricerca", border_style="yellow"))
+
+        return layout
+
     def _render_rich(self) -> Optional[Any]:
         """Renderizza interfaccia completa Rich"""
         if not RICH_AVAILABLE:
             return None
-        
+
+        if self.search_mode:
+            return self._render_rich_search()
+
         layout = self._build_rich_layout()
-        
+
         layout["header"].update(self._render_rich_header())
         layout["status"].update(self._render_rich_status())
         layout["stations"].update(self._render_rich_stations())
         layout["controls"].update(self._render_rich_controls())
-        layout["footer"].update(self._render_rich_footer())
-        
+
         return layout
     
     # ========================================================================
@@ -1488,16 +1815,26 @@ class RadioPlayer:
                 return char if char != '\x1b' else 'ESC'
             return None
         else:
-            if select.select([sys.stdin], [], [], 0.05)[0]:
-                char = sys.stdin.read(1)
-                if char == '\x1b':
+            fd = sys.stdin.fileno()
+            # Usa os.read() direttamente: sys.stdin.read(1) chiama internamente
+            # os.read(fd, 8192) e mette [A nel buffer Python; il select() successivo
+            # controlla il fd OS (ora vuoto) e restituisce False → frecce rotte.
+            if not select.select([fd], [], [], 0.05)[0]:
+                return None
+            try:
+                char = os.read(fd, 1).decode('utf-8', errors='ignore')
+            except Exception:
+                return None
+            if char == '\x1b':
+                # Controlla se seguono byte di sequenza (frecce) senza bloccare
+                if select.select([fd], [], [], 0.05)[0]:
                     try:
-                        next_chars = sys.stdin.read(2)
-                        return {'[A': 'UP', '[B': 'DOWN', '[C': 'RIGHT', '[D': 'LEFT'}.get(next_chars, 'ESC')
-                    except:
-                        return 'ESC'
-                return char
-            return None
+                        seq = os.read(fd, 2).decode('utf-8', errors='ignore')
+                        return {'[A': 'UP', '[B': 'DOWN', '[C': 'RIGHT', '[D': 'LEFT'}.get(seq, 'ESC')
+                    except Exception:
+                        pass
+                return 'ESC'
+            return char
     
     def handle_input(self):
         """Loop gestione input"""
@@ -1508,6 +1845,44 @@ class RadioPlayer:
                 continue
             
             try:
+                # Modalità ricerca RadioBrowser
+                if self.search_mode:
+                    if char == 'ESC':
+                        self.exit_search_mode()
+                    elif char == 'UP':
+                        if self.search_results:
+                            self.search_selected_idx = max(0, self.search_selected_idx - 1)
+                            self.pending_updates |= UpdateFlags.STATIONS
+                    elif char == 'DOWN':
+                        if self.search_results:
+                            self.search_selected_idx = min(
+                                len(self.search_results) - 1, self.search_selected_idx + 1
+                            )
+                            self.pending_updates |= UpdateFlags.STATIONS
+                    elif char in ('\r', '\n'):
+                        # Aggiungi stazione selezionata al M3U
+                        if self.search_results and 0 <= self.search_selected_idx < len(self.search_results):
+                            self.add_station_to_m3u(self.search_results[self.search_selected_idx])
+                    elif char.lower() == 'p':
+                        # Ascolta anteprima senza aggiungere al M3U
+                        if self.search_results and 0 <= self.search_selected_idx < len(self.search_results):
+                            self.play_preview(self.search_results[self.search_selected_idx])
+                    elif char == ' ':
+                        # Ferma anteprima
+                        if self.state.is_playing:
+                            self.stop()
+                            self.show_temp_message("⏹ Anteprima fermata")
+                    elif char in ('\x7f', '\x08'):  # Backspace / DEL
+                        if self.search_query:
+                            self.search_query = self.search_query[:-1]
+                            self._trigger_search()
+                            self.pending_updates |= UpdateFlags.STATUS
+                    elif len(char) == 1 and char.isprintable():
+                        self.search_query += char
+                        self._trigger_search()
+                        self.pending_updates |= UpdateFlags.STATUS
+                    continue
+
                 # Modalità input numerico
                 if self.number_input_mode:
                     if char.isdigit():
@@ -1556,8 +1931,9 @@ class RadioPlayer:
                     self.show_temp_message(f"💾 Salvato: {path.name}")
                     logger.info(f"Cronologia salvata: {path}")
                 elif char.lower() == 'h':
-                    # Mostra cronologia
                     self.show_history()
+                elif char.lower() == 'b':
+                    self.enter_search_mode()
                 elif char.isdigit():
                     self.number_input_mode = True
                     self.number_buffer = char
