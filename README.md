@@ -19,7 +19,7 @@ Lettore di stazioni radio da terminale, **cross-platform** (Linux · macOS · Wi
 │ 🎵 RADIO PLAYER M3U    ⏰ 14:32:18    00:47    🔊 Volume: 80%  📝 ✗  🔔  │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ╭─ Status ─────────────────────────────────────────────────────────────────╮
-│ ▶  IN RIPRODUZIONE  │  📡 Radio Deejay                                   │
+│ ▶  IN RIPRODUZIONE  │  📡 Radio Deejay                                  │
 │ 🎤 The Weeknd  🎼 Blinding Lights  [01:23]                               │
 │ 🔊 128 kbps • AAC • 📦 OK                                                │
 ╰──────────────────────────────────────────────────────────────────────────╯
