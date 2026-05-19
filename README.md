@@ -82,6 +82,7 @@ Lettore di stazioni radio da terminale, **cross-platform** (Linux · macOS · Wi
 | 📝 | Logging su file rotante, attivabile/disattivabile a runtime senza riavvio |
 | ⏱️ | Uptime di sessione persistente (non si resetta al cambio stazione) |
 | 🖥️ | Cross-platform: Linux, macOS, Windows |
+| 🖼️ | Icona nel system tray con menu contestuale (play/pausa, volume, cambio stazione) |
 
 ---
 
@@ -243,6 +244,8 @@ Il player integra la API pubblica di [RadioBrowser.info](https://www.radio-brows
 |-----------|----------|-----|
 | [`rich`](https://github.com/Textualize/rich) | ≥ 13.7 | Interfaccia TUI — obbligatoria |
 | [`requests`](https://requests.readthedocs.io) | ≥ 2.31 | Metadati ICY e API RadioBrowser |
+| [`pystray`](https://github.com/moses-palmer/pystray) | ≥ 0.19.5 | Icona system tray con menu contestuale |
+| [`Pillow`](https://python-pillow.org) | ≥ 10.0 | Generazione immagine icona tray |
 
 ```bash
 pip3 install -r requirements.txt
@@ -309,7 +312,7 @@ Assicurati di eseguire il player in un terminale che supporta le sequenze ANSI (
 Distribuito sotto la **GNU General Public License v3.0**.
 
 ```
-Copyright (C) 2025 Andres Zanzani <azanzani@gmail.com>
+Copyright (C) 2025–2026 Andres Zanzani <azanzani@gmail.com>
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
