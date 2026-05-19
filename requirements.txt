@@ -7,6 +7,10 @@ rich>=13.7.0
 # HTTP per metadati ICY (Shoutcast/Icecast)
 requests>=2.31.0
 
+# System tray icon (icona nella barra di sistema)
+pystray>=0.19.5
+Pillow>=10.0.0
+
 # Notifiche desktop su Windows (opzionale)
 # win10toast>=0.9
 # pywin32>=306

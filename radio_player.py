@@ -70,6 +70,15 @@ if platform.system() == "Windows":
 else:
     WIN32_AVAILABLE = False
 
+# System Tray (pystray + Pillow) - opzionale
+try:
+    import pystray
+    from pystray import Icon as TrayIcon, MenuItem as TrayItem, Menu as TrayMenu
+    from PIL import Image as PILImage, ImageDraw as PILDraw
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+
 # ============================================================================
 # CONFIGURAZIONE LOGGING
 # ============================================================================
@@ -543,6 +552,188 @@ class MetadataMonitor:
         logger.info("Loop metadata terminato")
 
 # ============================================================================
+# SYSTEM TRAY ICON
+# ============================================================================
+
+class SystemTrayIcon:
+    """Icona nel system tray con menu contestuale per controllare il player"""
+
+    ICON_SIZE = 64
+
+    def __init__(self, player: 'RadioPlayer'):
+        self.player = player
+        self._icon: Optional[Any] = None
+        self._thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    # Icona grafica
+    # ------------------------------------------------------------------
+
+    def _make_icon_image(self, playing: bool = True, muted: bool = False) -> Any:
+        """Crea un'immagine PIL per l'icona tray (nota musicale colorata)"""
+        size = self.ICON_SIZE
+        img = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = PILDraw.Draw(img)
+
+        # Sfondo circolare
+        if muted:
+            bg_color = (180, 50, 50, 220)     # rosso = muto
+        elif playing:
+            bg_color = (30, 160, 90, 220)     # verde = in riproduzione
+        else:
+            bg_color = (80, 80, 80, 220)      # grigio = fermo
+
+        draw.ellipse([2, 2, size - 2, size - 2], fill=bg_color)
+
+        # Nota musicale semplice (♪)
+        note_color = (255, 255, 255, 255)
+        # Testa nota (ellisse)
+        draw.ellipse([14, 38, 30, 50], fill=note_color)
+        # Gambo verticale
+        draw.rectangle([28, 14, 32, 44], fill=note_color)
+        # Bandiera orizzontale
+        draw.rectangle([28, 14, 48, 20], fill=note_color)
+        draw.rectangle([28, 24, 44, 30], fill=note_color)
+
+        if muted:
+            # Barra diagonale rossa per indicare muto
+            draw.line([8, 8, size - 8, size - 8], fill=(255, 60, 60, 255), width=5)
+
+        return img
+
+    # ------------------------------------------------------------------
+    # Azioni menu
+    # ------------------------------------------------------------------
+
+    def _action_play_pause(self, icon=None, item=None):
+        self.player.toggle_play_pause()
+        self._refresh_menu()
+
+    def _action_stop(self, icon=None, item=None):
+        self.player.stop()
+        self._refresh_menu()
+
+    def _action_mute(self, icon=None, item=None):
+        self.player.toggle_mute()
+        self._refresh_menu()
+
+    def _action_vol_up5(self, icon=None, item=None):
+        self.player.change_volume(5)
+        self._refresh_menu()
+
+    def _action_vol_down5(self, icon=None, item=None):
+        self.player.change_volume(-5)
+        self._refresh_menu()
+
+    def _action_quit(self, icon=None, item=None):
+        self.player.running = False
+        self.stop()
+
+    # ------------------------------------------------------------------
+    # Costruzione menu dinamico
+    # ------------------------------------------------------------------
+
+    def _build_menu(self) -> Any:
+        """Costruisce il menu contestuale con stato corrente"""
+        st = self.player.state
+
+        # Etichetta canzone corrente (read-only)
+        if st.stream_info and st.stream_info.song:
+            song_label = f"🎵 {st.stream_info.song[:50]}"
+        elif st.playing_station_index >= 0 and self.player.stations:
+            song_label = f"📻 {self.player.stations[st.playing_station_index].name[:50]}"
+        else:
+            song_label = "📻 Radio Player"
+
+        play_label = "⏸  Pausa" if (st.is_playing and not st.is_paused) else "▶  Play"
+        mute_label = "🔇 Riattiva audio" if st.is_muted else "🔇 Muto"
+        vol_label  = f"🔊 Volume: {st.volume}%"
+
+        return TrayMenu(
+            TrayItem(song_label,  None, enabled=False),
+            TrayMenu.SEPARATOR,
+            TrayItem(play_label,  self._action_play_pause),
+            TrayItem("⏹  Stop",   self._action_stop),
+            TrayMenu.SEPARATOR,
+            TrayItem(mute_label,  self._action_mute),
+            TrayMenu.SEPARATOR,
+            TrayItem(vol_label,   None, enabled=False),
+            TrayItem("🔊 Volume +5%", self._action_vol_up5),
+            TrayItem("🔉 Volume −5%", self._action_vol_down5),
+            TrayMenu.SEPARATOR,
+            TrayItem("❌ Esci",   self._action_quit),
+        )
+
+    def _refresh_menu(self):
+        """Aggiorna menu e icona con lo stato corrente"""
+        if self._icon is None:
+            return
+        st = self.player.state
+        self._icon.icon  = self._make_icon_image(
+            playing=st.is_playing and not st.is_paused,
+            muted=st.is_muted,
+        )
+        self._icon.menu  = self._build_menu()
+        self._icon.title = self._make_tooltip()
+
+    def _make_tooltip(self) -> str:
+        """Crea il testo tooltip per l'icona"""
+        st = self.player.state
+        parts = []
+        if st.playing_station_index >= 0 and self.player.stations:
+            parts.append(self.player.stations[st.playing_station_index].name)
+        if st.stream_info and st.stream_info.song:
+            parts.append(st.stream_info.song)
+        status = "▶ In riproduzione" if (st.is_playing and not st.is_paused) \
+            else ("⏸ In pausa" if st.is_paused else "⏹ Fermo")
+        if st.is_muted:
+            status += " 🔇"
+        parts.append(status)
+        return " | ".join(parts) if parts else "Radio Player"
+
+    # ------------------------------------------------------------------
+    # Ciclo di vita
+    # ------------------------------------------------------------------
+
+    def start(self):
+        """Avvia l'icona tray in un thread dedicato (non-bloccante)"""
+        if not TRAY_AVAILABLE:
+            logger.warning("pystray non disponibile: icona tray disabilitata")
+            return
+        try:
+            self._icon = TrayIcon(
+                name="RadioPlayer",
+                icon=self._make_icon_image(playing=False),
+                title="Radio Player",
+                menu=self._build_menu(),
+            )
+            self._thread = threading.Thread(
+                target=self._icon.run,
+                name="SystemTray",
+                daemon=True,
+            )
+            self._thread.start()
+            logger.info("Icona tray avviata")
+        except Exception as e:
+            logger.warning(f"Impossibile avviare icona tray: {e}")
+
+    def stop(self):
+        """Ferma l'icona tray"""
+        if self._icon is not None:
+            try:
+                self._icon.stop()
+            except Exception:
+                pass
+            self._icon = None
+        logger.info("Icona tray fermata")
+
+    def update(self):
+        """Aggiorna tooltip e icona (chiamare ad ogni cambio stato/canzone)"""
+        if self._icon is not None:
+            self._refresh_menu()
+
+
+# ============================================================================
 # CLIENT RADIOBROWSER.INFO
 # ============================================================================
 
@@ -836,6 +1027,9 @@ class RadioPlayer:
         self._preview_station: Optional[RadioStation] = None  # in ascolto ma non in M3U
         self.m3u_file_path: Optional[Path] = None
 
+        # System tray
+        self.tray = SystemTrayIcon(self)
+
         # Timer sessione: non si resetta al cambio stazione
         self.session_start_time = time.time()
         
@@ -954,6 +1148,7 @@ class RadioPlayer:
                     
                     self.pending_updates |= UpdateFlags.SONG | UpdateFlags.STATUS
                     logger.info(f"Nuovo brano: {artist} - {song}")
+                    self.tray.update()
             else:
                 if value != self.state.stream_info.song:
                     # Crea un NUOVO StreamInfo invece di modificare quello esistente
@@ -984,6 +1179,7 @@ class RadioPlayer:
                     
                     self.pending_updates |= UpdateFlags.SONG | UpdateFlags.STATUS
                     logger.info(f"Nuovo brano: {value}")
+                    self.tray.update()
     
     def _show_notification(self, message: str):
         """Mostra notifica di sistema"""
@@ -1042,6 +1238,7 @@ class RadioPlayer:
             self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG | UpdateFlags.STATIONS
             
             logger.info("Riproduzione avviata")
+            self.tray.update()
         else:
             logger.error("Impossibile avviare riproduzione")
     
@@ -1064,6 +1261,7 @@ class RadioPlayer:
             self._preview_station = None
 
             self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG | UpdateFlags.STATIONS
+            self.tray.update()
     
     def toggle_play_pause(self):
         """Toggle play/pause"""
@@ -1086,12 +1284,14 @@ class RadioPlayer:
                     self.state.stream_info.pause_start_time = None
                     self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG
                     logger.info("Riproduzione ripresa")
+                    self.tray.update()
                 else:
                     # Era in play -> pausa
                     self.state.is_paused = True
                     self.state.stream_info.pause_start_time = time.time()
                     self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG
                     logger.info("Riproduzione in pausa")
+                    self.tray.update()
     
     def change_volume(self, delta: int):
         """Cambia volume"""
@@ -1102,6 +1302,7 @@ class RadioPlayer:
         
         self.pending_updates |= UpdateFlags.TIMER
         logger.debug(f"Volume: {self.state.volume}%")
+        self.tray.update()
     
     def toggle_mute(self):
         """Toggle muto"""
@@ -1112,6 +1313,7 @@ class RadioPlayer:
         
         self.pending_updates |= UpdateFlags.TIMER
         logger.debug(f"Muto: {self.state.is_muted}")
+        self.tray.update()
     
     def change_selection(self, delta: int):
         """Cambia stazione selezionata"""
@@ -1492,6 +1694,7 @@ class RadioPlayer:
             Layout(name="status", size=5),
             Layout(name="stations", size=12),
             Layout(name="controls", ratio=1),
+            Layout(name="footer", size=1),
         )
 
         return layout
@@ -1629,34 +1832,38 @@ class RadioPlayer:
         return Panel(table, title=title, border_style="blue")
     
     def _render_rich_controls(self) -> Optional[Any]:
-        """Renderizza controlli Rich (2 righe compatte + eventuale input numero)"""
+        """Renderizza controlli Rich in tabella 4-colonne leggibile"""
         if not RICH_AVAILABLE:
             return None
 
-        lines = [
-            "[cyan]↑/↓[/cyan] Seleziona  "
-            "[cyan]p/Space[/cyan] Play/Pausa  "
-            "[cyan]+/=[/cyan] Vol+  "
-            "[cyan]-/_[/cyan] Vol-  "
-            "[cyan]m[/cyan] Muto  "
-            "[cyan]b[/cyan] Sfoglia RadioBrowser",
-
-            "[cyan]r[/cyan] Rec  "
-            "[cyan]l[/cyan] Log  "
-            "[cyan]t[/cyan] Notifiche  "
-            "[cyan]h[/cyan] Cronologia  "
-            "[cyan]s[/cyan] Salva  "
-            "[cyan]1-9+↵[/cyan] Vai a #  "
-            "[cyan]q[/cyan] Esci",
+        controls = [
+            ("↑/↓          ", "Seleziona stazione    ", "+/=           ", "Alza volume"),
+            ("p/Spazio      ", "Play/Pausa            ", "-/_           ", "Abbassa volume"),
+            ("m             ", "Muto/Riattiva         ", "1-9+Invio     ", "Vai a numero"),
+            ("r             ", "Rec ON/OFF            ", "l             ", "Log ON/OFF"),
+            ("t             ", "Toggle notifiche      ", "h             ", "Cronologia brani"),
+            ("b             ", "Sfoglia RadioBrowser  ", "s             ", "Salva cronologia"),
+            ("q             ", "Esci                  ", "              ", ""),
         ]
 
-        if self.number_input_mode:
-            lines.append(
-                f"[bold yellow]🔢 NUMERO: {self.number_buffer}_[/bold yellow]"
-                "  [dim](↵=conferma  Esc=annulla)[/dim]"
-            )
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column(justify="left", no_wrap=True, style="cyan")
+        table.add_column(justify="left", no_wrap=True)
+        table.add_column(justify="left", no_wrap=True, style="cyan")
+        table.add_column(justify="left", no_wrap=True)
 
-        return Panel("\n".join(lines), title="🎮 Controlli", border_style="yellow")
+        for left_key, left_desc, right_key, right_desc in controls:
+            table.add_row(left_key, left_desc, right_key, right_desc)
+
+        # Input numerico
+        if self.number_input_mode:
+            input_text = Text()
+            input_text.append("🔢 INSERISCI NUMERO: ", style="bold yellow")
+            input_text.append(f"{self.number_buffer}_", style="bold white")
+            input_text.append(" (Invio=conferma, Esc=annulla)", style="dim")
+            table.add_row(input_text, "", "", "")
+
+        return Panel(table, title="🎮 Controlli", border_style="yellow")
     
     def _render_rich_footer(self) -> Optional[Any]:
         """Renderizza footer Rich"""
@@ -1786,6 +1993,7 @@ class RadioPlayer:
         layout["status"].update(self._render_rich_status())
         layout["stations"].update(self._render_rich_stations())
         layout["controls"].update(self._render_rich_controls())
+        layout["footer"].update(self._render_rich_footer())
 
         return layout
     
@@ -1964,6 +2172,9 @@ class RadioPlayer:
                     print("Uso: python3 radio_player_improved.py [file.m3u]")
                     return
             
+            # Avvia icona tray
+            self.tray.start()
+
             # Avvia thread input
             self.executor.submit(self.handle_input)
             
@@ -1980,6 +2191,7 @@ class RadioPlayer:
         finally:
             self.stop()
             self.metadata_monitor.stop()
+            self.tray.stop()
             self.executor.shutdown(wait=False)
             self.restore_terminal()
             
