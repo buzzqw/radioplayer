@@ -1015,6 +1015,9 @@ class RadioPlayer:
         self.temp_message = ""
         self.temp_message_time = 0
 
+        # Overlay cronologia
+        self.show_history_overlay = False
+
         # RadioBrowser search
         self.radio_browser = RadioBrowserAPI()
         self.search_mode = False
@@ -1467,28 +1470,14 @@ class RadioPlayer:
         self.pending_updates |= UpdateFlags.STATUS
     
     def show_history(self):
-        """Mostra cronologia ultimi brani"""
+        """Mostra/nasconde overlay cronologia ultimi brani"""
+        self.show_history_overlay = not self.show_history_overlay
+        self.pending_updates |= UpdateFlags.FULL
         last = self.history.get_last(10)
-        
         if not last:
             self.show_temp_message("📜 Cronologia vuota")
-            return
-        
-        # Costruisci messaggio
-        msg_lines = ["📜 Ultimi 10 brani:"]
-        for i, entry in enumerate(reversed(last), 1):
-            artist = entry.get('artist', '')
-            song = entry.get('song', '')
-            station = entry.get('station', '')
-            
-            if artist and song:
-                msg_lines.append(f"{i}. {artist} - {song} ({station})")
-            elif song:
-                msg_lines.append(f"{i}. {song} ({station})")
-        
-        msg = "\n".join(msg_lines)
-        self.show_temp_message(msg)
-        logger.info(msg)
+            self.show_history_overlay = False
+        logger.info("Toggle overlay cronologia")
     
     # ========================================================================
     # RICERCA RADIOBROWSER
@@ -1837,13 +1826,13 @@ class RadioPlayer:
             return None
 
         controls = [
-            ("↑/↓          ", "Seleziona stazione    ", "+/=           ", "Alza volume"),
-            ("p/Spazio      ", "Play/Pausa            ", "-/_           ", "Abbassa volume"),
-            ("m             ", "Muto/Riattiva         ", "1-9+Invio     ", "Vai a numero"),
-            ("r             ", "Rec ON/OFF            ", "l             ", "Log ON/OFF"),
-            ("t             ", "Toggle notifiche      ", "h             ", "Cronologia brani"),
-            ("b             ", "Sfoglia RadioBrowser  ", "s             ", "Salva cronologia"),
-            ("q             ", "Esci                  ", "              ", ""),
+            ("↑/↓",    "📋 Seleziona stazione",    "+/=",    "🔊 Alza volume"),
+            ("p/Spazio", "▶️  Play/Pausa",           "-/_",    "🔉 Abbassa volume"),
+            ("m",       "🔇 Muto/Riattiva",          "1-9+↵",  "🔢 Vai a numero"),
+            ("r",       "⏺️  Rec ON/OFF",             "l",      "📝 Log ON/OFF"),
+            ("t",       "🔔 Toggle notifiche",       "h",      "📜 Cronologia brani"),
+            ("b",       "🌐 Sfoglia RadioBrowser",   "s",      "💾 Salva cronologia"),
+            ("q",       "🚪 Esci",                   "",       ""),
         ]
 
         table = Table(show_header=False, box=None, padding=(0, 1))
@@ -1979,6 +1968,46 @@ class RadioPlayer:
 
         return layout
 
+    def _render_rich_history(self) -> Optional[Any]:
+        """Renderizza overlay cronologia brani"""
+        if not RICH_AVAILABLE:
+            return None
+
+        last = self.history.get_last(10)
+
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="hist_panel", ratio=1),
+            Layout(name="footer", size=1),
+        )
+        layout["header"].update(self._render_rich_header())
+
+        table = Table(show_header=True, box=None, padding=(0, 1))
+        table.add_column("#", style="dim", width=3, justify="right")
+        table.add_column("Artista", style="cyan", ratio=2)
+        table.add_column("Brano", style="white", ratio=3)
+        table.add_column("Stazione", style="green", ratio=2)
+        table.add_column("Orario", style="dim", width=8)
+
+        if last:
+            for i, entry in enumerate(reversed(last), 1):
+                artist  = entry.get('artist', '') or ''
+                song    = entry.get('song', '') or ''
+                station = entry.get('station', '') or ''
+                ts      = entry.get('timestamp', '')
+                orario  = ts[11:16] if len(ts) >= 16 else ''
+                table.add_row(str(i), artist, song, station, orario)
+        else:
+            table.add_row("", "[dim italic]Nessun brano in cronologia[/dim italic]", "", "", "")
+
+        layout["hist_panel"].update(
+            Panel(table, title="📜 Cronologia brani  [dim](premi H per chiudere)[/dim]",
+                  border_style="magenta")
+        )
+        layout["footer"].update(self._render_rich_footer())
+        return layout
+
     def _render_rich(self) -> Optional[Any]:
         """Renderizza interfaccia completa Rich"""
         if not RICH_AVAILABLE:
@@ -1986,6 +2015,9 @@ class RadioPlayer:
 
         if self.search_mode:
             return self._render_rich_search()
+
+        if self.show_history_overlay:
+            return self._render_rich_history()
 
         layout = self._build_rich_layout()
 
@@ -2107,6 +2139,14 @@ class RadioPlayer:
                         self.number_buffer = ""
                         self.pending_updates |= UpdateFlags.INPUT
                     continue
+                
+                # Overlay cronologia: qualsiasi tasto lo chiude (tranne h che fa toggle)
+                if self.show_history_overlay:
+                    if char.lower() != 'h':
+                        self.show_history_overlay = False
+                        self.pending_updates |= UpdateFlags.FULL
+                        continue
+                    # 'h' fa toggle (chiude), gestito sotto
                 
                 # Comandi normali
                 if char.lower() == 'q':
