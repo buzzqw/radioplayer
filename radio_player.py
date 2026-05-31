@@ -2201,15 +2201,14 @@ class RadioPlayer:
                     print(f"❌ Impossibile caricare {m3u_file}")
                     return
             else:
-                # Cerca file M3U nella directory corrente
-                m3u_files = list(Path('.').glob('*.m3u'))
+                m3u_files = find_m3u_files()
                 if m3u_files:
                     if not self.load_m3u(m3u_files[0]):
                         print("❌ Errore caricamento M3U")
                         return
                 else:
                     print("❌ Nessun file M3U trovato")
-                    print("Uso: python3 radio_player_improved.py [file.m3u]")
+                    print(f"Uso: python3 {Path(sys.argv[0]).name} [file.m3u]")
                     return
             
             # Avvia icona tray
@@ -2309,6 +2308,15 @@ class RadioPlayer:
 # MAIN
 # ============================================================================
 
+def find_m3u_files() -> List[Path]:
+    """Cerca file M3U nella directory dello script e nella directory corrente"""
+    found: dict = {}
+    for directory in (Path(__file__).parent, Path.cwd()):
+        for f in sorted(directory.glob('*.m3u')):
+            found[f.resolve()] = f
+    return list(found.values())
+
+
 def main():
     """Funzione principale"""
     print("=" * 70)
@@ -2316,14 +2324,43 @@ def main():
     print("Copyright (C) 2025 Andres Zanzani <azanzani@gmail.com>")
     print("=" * 70)
     print()
-    
+
     m3u_file = None
     if len(sys.argv) > 1:
         m3u_file = Path(sys.argv[1])
         if not m3u_file.exists():
             print(f"❌ File non trovato: {m3u_file}")
             return
-    
+    else:
+        m3u_files = find_m3u_files()
+        if not m3u_files:
+            print("❌ Nessun file M3U trovato")
+            print(f"   Directory script:   {Path(__file__).parent}")
+            print(f"   Directory corrente: {Path.cwd()}")
+            print(f"Uso: python3 {Path(sys.argv[0]).name} [file.m3u]")
+            return
+        elif len(m3u_files) == 1:
+            m3u_file = m3u_files[0]
+            print(f"📂 File M3U trovato: {m3u_file}")
+        else:
+            print("📂 File M3U disponibili:")
+            for i, f in enumerate(m3u_files, 1):
+                print(f"   {i}. {f}")
+            print()
+            while True:
+                try:
+                    raw = input(f"Scegli il file da usare (1-{len(m3u_files)}): ").strip()
+                    idx = int(raw) - 1
+                    if 0 <= idx < len(m3u_files):
+                        m3u_file = m3u_files[idx]
+                        break
+                    print(f"❌ Inserisci un numero tra 1 e {len(m3u_files)}")
+                except ValueError:
+                    print("❌ Inserisci un numero valido")
+                except (KeyboardInterrupt, EOFError):
+                    print("\n👋 Annullato")
+                    return
+
     try:
         player = RadioPlayer()
         player.run(m3u_file)
