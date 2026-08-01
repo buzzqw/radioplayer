@@ -1,0 +1,19 @@
+#EXTM3U
+#EXTINF:-1,IT::Venice Radio
+http://5.135.173.165/stream1
+#EXTINF:-1,IT::RDS
+http://stream1.rds.it:8000/rds64k
+#EXTINF:-1,IT::Radio Rai1
+http://icestreaming.rai.it/1.mp3
+#EXTINF:-1,IT::Radio Rai2
+http://icestreaming.rai.it/2.mp3
+#EXTINF:-1,IT::Radio Rai3
+http://icestreaming.rai.it/3.mp3
+#EXTINF:-1,IT::Radio Rai5 Classica
+http://icestreaming.rai.it/5.mp3
+#EXTINF:-1,IT::Radio Classica CH
+http://relay.publicdomainproject.org/classical.mp3
+#EXTINF:-1,IT::Classical Essential
+http://strm112.1.fm/polskafm_mobile_mp3
+#EXTINF:-1,Radio Bruno
+http://onair18.xdevel.com:8062/;

@@ -1,0 +1,52 @@
+#EXTM3U
+# Radio Player M3U - Stazioni di esempio
+# Sostituisci/rimuovi a tuo piacimento
+
+# === Stazioni italiane ===
+#EXTINF:-1 group-title="Italia",Radio Deejay
+https://4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejay/playlist.m3u8
+
+#EXTINF:-1 group-title="Italia",RDS Relax
+https://stream.rds.radio/audio/rdsrelax/master.m3u8
+
+#EXTINF:-1 group-title="Italia",Virgin Radio Italia
+https://icecast.unitedradio.it/Virgin.mp3
+
+#EXTINF:-1 group-title="Italia",Radio Capital
+https://4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/capital/playlist.m3u8
+
+#EXTINF:-1 group-title="Italia",m2o
+https://4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/m2o/playlist.m3u8
+
+#EXTINF:-1 group-title="Italia",Radio 105
+https://icecast.unitedradio.it/Radio105.mp3
+
+#EXTINF:-1 group-title="Italia",RTL 102.5
+https://streamcdnb6-4c4b867c89244861ac216426883d1ad0.msvdn.net/rtl1025/master.m3u8
+
+#EXTINF:-1 group-title="Italia",Radio Kiss Kiss
+https://kk.fluidstream.eu/KKItalia.aac
+
+# === Internazionali: BBC ===
+#EXTINF:-1 group-title="UK",BBC Radio 1
+http://stream.live.vc.bbcmedia.co.uk/bbc_radio_one
+
+#EXTINF:-1 group-title="UK",BBC Radio 2
+http://stream.live.vc.bbcmedia.co.uk/bbc_radio_two
+
+#EXTINF:-1 group-title="UK",BBC Radio 4
+http://stream.live.vc.bbcmedia.co.uk/bbc_radio_fourfm
+
+# === Jazz e musica di qualita' ===
+#EXTINF:-1 group-title="Jazz",Smooth Jazz
+https://ice1.somafm.com/secretagent-256-mp3
+
+#EXTINF:-1 group-title="Jazz",Jazz Radio Paris
+http://jazzradio.ice.infomaniak.ch/jazzradio-high.mp3
+
+#EXTINF:-1 group-title="Relax",Zen Radio
+http://stream.zenradio.fr/zenradio.mp3
+
+# === News / Talk ===
+#EXTINF:-1 group-title="News",France Info
+http://direct.franceinfo.fr/live/franceinfo-midfi.mp3

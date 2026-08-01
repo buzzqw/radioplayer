@@ -4,13 +4,20 @@
 # Interfaccia TUI avanzata (fortemente consigliata)
 rich>=13.7.0
 
-# HTTP per metadati ICY (Shoutcast/Icecast)
+# HTTP per metadati ICY (Shoutcast/Icecast) e RadioBrowser.info
 requests>=2.31.0
+urllib3>=1.26
 
 # System tray icon (icona nella barra di sistema)
 pystray>=0.19.5
 Pillow>=10.0.0
 
-# Notifiche desktop su Windows (opzionale)
-# win10toast>=0.9
+# === Windows (opzionali) ===
 # pywin32>=306
+# win10toast>=0.9
+
+# === Sviluppo ===
+pytest>=7.0
+pytest-cov>=4.0
+ruff>=0.1.0
+pyright>=1.1.300

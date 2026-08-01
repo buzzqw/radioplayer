@@ -1,0 +1,13 @@
+{
+    "include": ["radioplayer"],
+    "exclude": ["tests", ".venv", "dist", "build"],
+    "typeCheckingMode": "basic",
+    "pythonVersion": "3.8",
+    "reportMissingImports": true,
+    "reportMissingTypeStubs": false,
+    "reportUnusedImport": "warning",
+    "reportUnusedVariable": "warning",
+    "reportUnnecessaryIsInstance": "warning",
+    "reportUnnecessaryCast": "warning",
+    "reportUnnecessaryComparison": "warning"
+}
