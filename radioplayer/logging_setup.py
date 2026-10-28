@@ -59,3 +59,17 @@ def disable_file_logging(logger: logging.Logger) -> None:
     for handler in logger.handlers:
         if isinstance(handler, RotatingFileHandler):
             handler.setLevel(logging.CRITICAL + 1)
+
+
+def set_console_logging(enabled: bool) -> None:
+    """Abilita/disabilita l'output su console.
+
+    Con la UI Rich attiva, un log su stderr corromperebbe lo schermo: in quel
+    caso gli errori restano nel file di log e vengono mostrati nell'UI.
+    """
+    logger = logging.getLogger("RadioPlayer")
+    for handler in logger.handlers:
+        if isinstance(handler, RotatingFileHandler):
+            continue
+        if isinstance(handler, logging.StreamHandler):
+            handler.setLevel(logging.ERROR if enabled else logging.CRITICAL + 1)

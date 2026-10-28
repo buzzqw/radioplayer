@@ -1,7 +1,7 @@
 """Data models for Radio Player M3U."""
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Dict, List, Any
 from enum import Flag, auto
 
@@ -86,17 +86,7 @@ class StreamInfo:
 
     def replace(self, **kwargs) -> "StreamInfo":
         """Crea una nuova istanza con i campi specificati modificati."""
-        current = {
-            "artist": self.artist, "song": self.song, "title": self.title,
-            "bitrate": self.bitrate, "audio_bitrate": self.audio_bitrate,
-            "codec": self.codec, "buffer_status": self.buffer_status,
-            "cache_duration": self.cache_duration, "start_time": self.start_time,
-            "song_start_time": self.song_start_time,
-            "pause_start_time": self.pause_start_time,
-            "total_pause_time": self.total_pause_time,
-        }
-        current.update(kwargs)
-        return StreamInfo(**current)
+        return replace(self, **kwargs)
 
 
 @dataclass

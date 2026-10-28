@@ -28,8 +28,10 @@ def get_socket_path() -> str:
 class MPVController:
     """Gestisce il processo MPV e la comunicazione IPC"""
 
-    def __init__(self, socket_path: Optional[str] = None):
+    def __init__(self, socket_path: Optional[str] = None,
+                 audio_device: Optional[str] = None):
         self.socket_path = socket_path or get_socket_path()
+        self.audio_device = audio_device
         self.process: Optional[subprocess.Popen] = None
         self.ipc_client = MPVIPCClient(self.socket_path)
         logger.info(f"Inizializzato MPVController su {self.socket_path}")
@@ -37,6 +39,7 @@ class MPVController:
     def start(self, url: str, volume: int = 50) -> bool:
         """Avvia MPV con lo stream"""
         try:
+            self.ipc_client.close()
             if platform.system() != "Windows" and os.path.exists(self.socket_path):
                 try:
                     os.remove(self.socket_path)
@@ -51,33 +54,48 @@ class MPVController:
                 '--quiet',
                 '--no-terminal',
                 '--cache=yes',
-                '--demuxer-max-bytes=2M',
-                '--audio-buffer=0.2',
+                '--demuxer-max-bytes=8M',
+                '--audio-buffer=0.5',
                 f'--input-ipc-server={self.socket_path}',
-                url
             ]
+            if self.audio_device:
+                cmd.append(f'--ao={self.audio_device}')
+            cmd.append(url)
 
             logger.info(f"Avvio MPV: {' '.join(cmd)}")
 
-            preexec = os.setsid if platform.system() != "Windows" else None
+            kwargs = {}
+            if platform.system() != "Windows":
+                # start_new_session evita i rischi di preexec_fn in applicazioni
+                # multithread (tray + input + monitor).
+                kwargs["start_new_session"] = True
+
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                preexec_fn=preexec,
+                **kwargs,
             )
 
-            for _ in range(20):
-                time.sleep(0.1)
-                if platform.system() != "Windows" and os.path.exists(self.socket_path):
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if self.process.poll() is not None:
+                    logger.error("MPV terminato durante l'avvio")
+                    self.process = None
+                    return False
+                if platform.system() == "Windows":
+                    time.sleep(0.2)
                     break
+                if os.path.exists(self.socket_path):
+                    break
+                time.sleep(0.05)
 
-            if self.process.poll() is None:
+            if self.process is not None and self.process.poll() is None:
                 logger.info("MPV avviato con successo")
                 return True
-            else:
-                logger.error("MPV terminato immediatamente")
-                return False
+
+            logger.error("MPV terminato immediatamente")
+            return False
 
         except Exception as e:
             logger.error(f"Errore avvio MPV: {e}", exc_info=True)
@@ -86,6 +104,7 @@ class MPVController:
     def stop(self):
         """Ferma MPV"""
         if not self.process:
+            self.ipc_client.close()
             return
 
         try:
@@ -113,6 +132,7 @@ class MPVController:
         except Exception as e:
             logger.error(f"Errore stop MPV: {e}")
         finally:
+            self.ipc_client.close()
             self.process = None
 
             if platform.system() != "Windows" and os.path.exists(self.socket_path):
@@ -133,8 +153,12 @@ class MPVController:
         """Imposta muto"""
         return self.ipc_client.set_property("mute", muted)
 
+    def set_pause(self, paused: bool) -> bool:
+        """Mette in pausa/riprende MPV (non solo muto)."""
+        return self.ipc_client.set_property("pause", paused)
+
     def get_audio_stats(self) -> Dict[str, Any]:
-        """Ottiene statistiche audio"""
+        """Ottiene statistiche audio."""
         stats = {}
 
         bitrate = self.ipc_client.get_property("audio-bitrate")
@@ -143,7 +167,7 @@ class MPVController:
 
         codec = self.ipc_client.get_property("audio-codec-name")
         if codec:
-            stats['codec'] = codec.upper()
+            stats['codec'] = str(codec).upper()
 
         cache = self.ipc_client.get_property("demuxer-cache-duration")
         if cache:

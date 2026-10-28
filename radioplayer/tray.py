@@ -2,6 +2,7 @@
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -29,6 +30,9 @@ class SystemTrayIcon:
         self.player = player
         self._icon: Optional[Any] = None
         self._thread: Optional[threading.Thread] = None
+        self._update_lock = threading.Lock()
+        self._last_update = 0.0
+        self._update_timer: Optional[threading.Timer] = None
 
     def _make_icon_image(self, playing: bool = True, muted: bool = False) -> Any:
         """Crea un'immagine PIL per l'icona tray (nota musicale colorata)"""
@@ -155,9 +159,32 @@ class SystemTrayIcon:
         return " | ".join(parts) if parts else "Radio Player"
 
     def update(self):
-        """Aggiorna tooltip e icona (chiamare ad ogni cambio stato/canzone)"""
-        if self._icon is not None:
+        """Aggiorna tooltip e icona, al massimo ogni 200 ms."""
+        if self._icon is None:
+            return
+
+        now = time.monotonic()
+        with self._update_lock:
+            if now - self._last_update >= 0.2:
+                self._last_update = now
+                refresh_now = True
+            else:
+                refresh_now = False
+                if self._update_timer is None:
+                    delay = max(0.05, 0.2 - (now - self._last_update))
+                    timer = threading.Timer(delay, self._delayed_update)
+                    timer.daemon = True
+                    self._update_timer = timer
+                    timer.start()
+
+        if refresh_now:
             self._refresh_menu()
+
+    def _delayed_update(self):
+        with self._update_lock:
+            self._update_timer = None
+            self._last_update = time.monotonic()
+        self._refresh_menu()
 
     def start(self):
         """Avvia l'icona tray in un thread dedicato (non-bloccante)"""
@@ -183,6 +210,10 @@ class SystemTrayIcon:
 
     def stop(self):
         """Ferma l'icona tray"""
+        with self._update_lock:
+            if self._update_timer is not None:
+                self._update_timer.cancel()
+                self._update_timer = None
         if self._icon is not None:
             try:
                 self._icon.stop()

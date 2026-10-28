@@ -56,3 +56,28 @@ class TestMetadataHistory:
         h.add("Artist", "Song", "Station")
         last = h.get_last(1)
         assert "timestamp" in last[0]
+
+    def test_load_from_json(self, tmp_path):
+        path = tmp_path / "history.json"
+        path.write_text(
+            '[{"artist": "A", "song": "S", "station": "R", "timestamp": "2025-01-01T10:00:00"}]',
+            encoding="utf-8",
+        )
+        h = MetadataHistory()
+        h.load(path)
+        last = h.get_last(1)
+        assert last[0]["artist"] == "A"
+        assert last[0]["song"] == "S"
+
+    def test_load_ignores_invalid_entries(self, tmp_path):
+        path = tmp_path / "history.json"
+        path.write_text('[null, "bad", {"artist": "A"}]', encoding="utf-8")
+        h = MetadataHistory()
+        h.load(path)
+        assert len(h.history) == 1
+        assert h.get_last(1)[0]["artist"] == "A"
+
+    def test_load_missing_file_is_noop(self, tmp_path):
+        h = MetadataHistory()
+        h.load(tmp_path / "missing.json")
+        assert len(h.history) == 0

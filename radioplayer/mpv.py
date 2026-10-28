@@ -3,101 +3,154 @@
 import json
 import logging
 import os
-import socket
 import platform
+import socket
+import threading
+import time
 from typing import Any, Optional
 
 logger = logging.getLogger("RadioPlayer")
 
 
 class MPVIPCClient:
-    """Client IPC per comunicare con MPV tramite socket"""
+    """Client IPC per comunicare con MPV tramite socket.
+
+    Su Unix mantiene una connessione persistente: aprire un socket per ogni
+    proprieta' (come nella versione precedente) costa decine di connessioni al
+    minuto durante il polling delle statistiche.
+    """
 
     def __init__(self, socket_path: str):
         self.socket_path = socket_path
         self._request_id = 0
+        self._lock = threading.Lock()
+        self._sock: Optional[socket.socket] = None
+        self._file: Optional[Any] = None
         logger.info(f"Inizializzato MPV IPC client: {socket_path}")
 
-    def send_command(self, command: str, *args, timeout: float = 2.0) -> Optional[Any]:
-        """Invia un comando a MPV e attende la risposta"""
-        self._request_id += 1
-        request = {
-            "command": [command, *args],
-            "request_id": self._request_id
-        }
+    @property
+    def _is_windows(self) -> bool:
+        return platform.system() == "Windows"
 
-        logger.debug(f"IPC send: {request}")
+    def _close_unix(self) -> None:
+        file_obj, sock = self._file, self._sock
+        self._file = None
+        self._sock = None
+        for obj in (file_obj, sock):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
 
-        try:
-            if platform.system() == "Windows":
-                return self._send_windows(request, timeout)
-            else:
-                return self._send_unix(request, timeout)
-        except Exception as e:
-            logger.error(f"Errore IPC command '{command}': {e}")
-            return None
+    def close(self) -> None:
+        """Chiude la connessione persistente (se presente)."""
+        with self._lock:
+            self._close_unix()
 
-    def _send_unix(self, request: dict, timeout: float) -> Optional[Any]:
-        """Invia comando su Unix socket"""
+    def _ensure_unix(self, timeout: float) -> bool:
+        if self._sock is not None:
+            return True
         if not os.path.exists(self.socket_path):
-            logger.warning(f"Socket non esiste: {self.socket_path}")
-            return None
-
+            return False
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(timeout)
-                sock.connect(self.socket_path)
-                sock.sendall((json.dumps(request) + "\n").encode('utf-8'))
+            sock.connect(self.socket_path)
+        except Exception:
+            sock.close()
+            raise
+        self._sock = sock
+        self._file = sock.makefile("rwb")
+        return True
 
-                buffer = b""
+    def send_command(self, command: str, *args, timeout: float = 2.0) -> Optional[Any]:
+        """Invia un comando a MPV e restituisce il campo data."""
+        success, data = self._dispatch(command, args, timeout)
+        return data if success else None
+
+    def send_command_ok(self, command: str, *args, timeout: float = 2.0) -> bool:
+        """Invia un comando e restituisce True se MPV lo ha accettato."""
+        success, _ = self._dispatch(command, args, timeout)
+        return success
+
+    def _dispatch(self, command: str, args: tuple, timeout: float):
+        with self._lock:
+            self._request_id += 1
+            request = {
+                "command": [command, *args],
+                "request_id": self._request_id,
+            }
+
+            logger.debug(f"IPC send: {request}")
+
+            try:
+                if self._is_windows:
+                    return self._send_windows(request, timeout)
+                return self._send_unix(request, timeout)
+            except Exception as e:
+                logger.error(f"Errore IPC command '{command}': {e}")
+                self._close_unix()
+                return False, None
+
+    def _send_unix(self, request: dict, timeout: float):
+        """Invia comando su Unix socket, riconnettendosi se necessario."""
+        for attempt in range(2):
+            try:
+                if not self._ensure_unix(timeout):
+                    logger.warning(f"Socket non esiste: {self.socket_path}")
+                    return False, None
+
+                assert self._file is not None
+                assert self._sock is not None
+                self._file.write((json.dumps(request) + "\n").encode("utf-8"))
+                self._file.flush()
+
+                deadline = time.monotonic() + timeout
                 while True:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    buffer += chunk
-                    if b"\n" in buffer:
-                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout()
+                    self._sock.settimeout(remaining)
+                    line = self._file.readline()
+                    if not line:
+                        raise ConnectionError("socket chiuso da mpv")
 
-                if buffer:
-                    # mpv puo' inviare piu' oggetti JSON (risposta + eventi)
-                    # separati da newline. Parsiamo tutte le righe e cerchiamo
-                    # quella con il request_id che abbiamo inviato.
-                    for line in buffer.decode('utf-8').split("\n"):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            response = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+                    try:
+                        response = json.loads(line.decode("utf-8").strip())
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
 
-                        logger.debug(f"IPC response: {response}")
+                    logger.debug(f"IPC response: {response}")
 
-                        if response.get("request_id") == self._request_id:
-                            if response.get("error") == "success":
-                                return response.get("data")
-                            else:
-                                logger.warning(f"IPC error: {response.get('error')}")
-                            return None
+                    if response.get("request_id") != request["request_id"]:
+                        # Evento asincrono di mpv: ignoralo.
+                        continue
 
-                return None
+                    if response.get("error") == "success":
+                        return True, response.get("data")
+                    logger.warning(f"IPC error: {response.get('error')}")
+                    return False, None
 
-        except socket.timeout:
-            logger.warning(f"IPC timeout per comando: {request['command'][0]}")
-            return None
-        except (ConnectionRefusedError, FileNotFoundError) as e:
-            logger.warning(f"IPC Unix connection error: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Errore IPC Unix: {e}")
-            return None
+            except (socket.timeout, ConnectionError, OSError) as e:
+                self._close_unix()
+                if attempt == 0:
+                    logger.debug(f"IPC riconnessione dopo errore: {e}")
+                    continue
+                logger.warning(f"IPC errore su '{request['command'][0]}': {e}")
+                return False, None
+            except Exception as e:
+                self._close_unix()
+                logger.error(f"Errore IPC Unix: {e}")
+                return False, None
 
-    def _send_windows(self, request: dict, timeout: float) -> Optional[Any]:
-        """Invia comando su Windows named pipe"""
+        return False, None
+
+    def _send_windows(self, request: dict, timeout: float):
+        """Invia comando su Windows named pipe."""
         try:
+            import pywintypes  # noqa: F401
             import win32file
-            import win32pipe
-            import pywintypes
 
             handle = win32file.CreateFile(
                 self.socket_path,
@@ -107,27 +160,37 @@ class MPVIPCClient:
                 0, None
             )
 
-            message = (json.dumps(request) + "\n").encode('utf-8')
-            win32file.WriteFile(handle, message)
+            try:
+                message = (json.dumps(request) + "\n").encode('utf-8')
+                win32file.WriteFile(handle, message)
 
-            result, data = win32file.ReadFile(handle, 4096)
-            win32file.CloseHandle(handle)
+                _result, data = win32file.ReadFile(handle, 4096)
+            finally:
+                win32file.CloseHandle(handle)
 
             if data:
-                response = json.loads(data.decode('utf-8').strip())
-                logger.debug(f"IPC response: {response}")
+                for line in data.decode("utf-8", errors="ignore").split("\n"):
+                    if not line.strip():
+                        continue
+                    try:
+                        response = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if response.get("request_id") != request["request_id"]:
+                        continue
+                    if response.get("error") == "success":
+                        return True, response.get("data")
+                    logger.warning(f"IPC error: {response.get('error')}")
+                    return False, None
 
-                if response.get("error") == "success":
-                    return response.get("data")
-
-            return None
+            return False, None
 
         except ImportError:
             logger.error("win32file non disponibile per IPC Windows")
-            return None
+            return False, None
         except Exception as e:
             logger.error(f"Errore IPC Windows: {e}")
-            return None
+            return False, None
 
     def get_property(self, property_name: str) -> Optional[Any]:
         """Ottiene una proprieta' da MPV"""
@@ -135,5 +198,4 @@ class MPVIPCClient:
 
     def set_property(self, property_name: str, value: Any) -> bool:
         """Imposta una proprieta' in MPV"""
-        result = self.send_command("set_property", property_name, value)
-        return result is not None
+        return self.send_command_ok("set_property", property_name, value)

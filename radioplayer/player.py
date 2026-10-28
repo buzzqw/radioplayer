@@ -3,24 +3,24 @@
 import logging
 import os
 import platform
-import queue
 import re
-import select
 import signal
 import subprocess
 import sys
-import termios
 import threading
 import time
-import tty
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Any
+from typing import Optional, List, Tuple
 
 from .config import load_config, save_config
-from .logging_setup import setup_logging, enable_file_logging, disable_file_logging
-from .m3u import M3UParser
+from .logging_setup import (
+    setup_logging,
+    enable_file_logging,
+    disable_file_logging,
+    set_console_logging,
+)
+from .m3u import M3UParser, discover_m3u_files
 from .metadata import MetadataHistory, MetadataMonitor
 from .models import RadioStation, StreamInfo, PlayerState, UpdateFlags
 from .mpv_controller import MPVController
@@ -32,31 +32,40 @@ logger = setup_logging()
 
 if platform.system() == "Windows":
     import msvcrt
+else:
+    import select
+    import termios
+    import tty
 
 
 class RadioPlayer(RichUIMixin):
     """Radio Player principale con gestione avanzata"""
 
-    def __init__(self, use_rich: bool = RICH_AVAILABLE):
+    def __init__(self, use_rich: bool = RICH_AVAILABLE,
+                 audio_device: Optional[str] = None,
+                 color: bool = True,
+                 use_tray: bool = True):
         self.use_rich = use_rich and RICH_AVAILABLE
+        self.use_tray = use_tray
 
         self.stations: List[RadioStation] = []
         self.state = PlayerState()
-        self.mpv_controller = MPVController()
+        self.mpv_controller = MPVController(audio_device=audio_device)
         self.metadata_monitor = MetadataMonitor(self._on_metadata_update)
         self.history = MetadataHistory()
-
-        self.executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="RadioPlayer")
-        self.update_queue: queue.Queue = queue.Queue()
+        self.history_file = Path.home() / ".config" / "radioplayer" / "history.json"
+        self.history.load(self.history_file)
 
         self.running = True
         self.pending_updates = UpdateFlags.FULL
-        self._executor_closed = False
         self._last_notified_title = ""
+        self._play_generation = 0
+        self._icy_fallback_started = False
+        self._play_started_at = 0.0
 
         if self.use_rich:
             from rich.console import Console
-            self.console = Console()
+            self.console = Console(no_color=not color)
         self.live = None
 
         self.old_settings = None
@@ -67,6 +76,7 @@ class RadioPlayer(RichUIMixin):
         self.is_recording = False
         self.recording_process: Optional[subprocess.Popen] = None
         self.recording_file: Optional[Path] = None
+        self._recording_via_mpv = False
 
         self.logging_enabled = False
 
@@ -81,10 +91,16 @@ class RadioPlayer(RichUIMixin):
         self.search_results: List[RadioStation] = []
         self.search_selected_idx = 0
         self.search_loading = False
+        self.search_error = ""
+        self.search_offset = 0
+        self.search_has_more = False
+        self.search_loading_more = False
         self._search_timer: Optional[threading.Timer] = None
         self._last_searched_query = ""
         self._preview_station: Optional[RadioStation] = None
         self.m3u_file_path: Optional[Path] = None
+        self._last_m3u: Optional[Path] = None
+        self._last_station_url: Optional[str] = None
 
         # Group filter
         self.group_filter: Optional[str] = None
@@ -92,10 +108,32 @@ class RadioPlayer(RichUIMixin):
 
         # Favorites (set of URLs)
         self.favorites: set = set()
+        self.show_favorites_only = False
 
         # Local M3U search
         self.local_search_mode = False
         self.local_search_query = ""
+
+        # Cache della lista visibile (filtri gruppo/preferiti/ricerca)
+        self._filtered_cache: Optional[List[Tuple[int, RadioStation]]] = None
+        self._filtered_positions: dict = {}
+
+        # Eliminazione con doppia conferma + undo
+        self._pending_delete: Optional[Tuple[int, float]] = None
+        self._last_deleted: Optional[Tuple[RadioStation, int, float]] = None
+
+        # Overlay selezione gruppo
+        self.show_group_overlay = False
+        self.group_overlay_idx = 0
+
+        # Layout adattivo
+        self._stations_visible_rows = 10
+        self._last_console_size: Optional[Tuple[int, int]] = None
+        self._layout_has_footer = True
+
+        # Debounce salvataggio configurazione
+        self._config_save_timer: Optional[threading.Timer] = None
+        self._config_lock = threading.Lock()
 
         # EQ presets (filter string per IPC mpv, senza prefisso --af=)
         self.eq_presets = [
@@ -140,41 +178,108 @@ class RadioPlayer(RichUIMixin):
             logger.info("MPV disponibile")
             return True
         except (subprocess.CalledProcessError, FileNotFoundError):
-            logger.error("MPV non trovato")
+            logger.warning("MPV non trovato")
             return False
 
     def _load_user_config(self) -> None:
         """Carica config utente e applica le preferenze salvate."""
         config = load_config()
-        self.state.volume = config.get("volume", 50)
-        self.state.show_song_popups = config.get("show_song_popups", True)
+        self.state.volume = max(0, min(100, int(config.get("volume", 50))))
+        self.state.show_song_popups = bool(config.get("show_song_popups", True))
         if config.get("logging_enabled"):
             self.logging_enabled = True
             enable_file_logging(logger)
         self.favorites = set(config.get("favorites", []))
+        self.show_favorites_only = bool(config.get("favorites_only", False))
         self.group_filter = config.get("group_filter")
-        self.eq_preset_idx = config.get("eq_preset_idx", 0)
+        self.eq_preset_idx = int(config.get("eq_preset_idx", 0))
+        if not 0 <= self.eq_preset_idx < len(self.eq_presets):
+            self.eq_preset_idx = 0
+        last_m3u = config.get("last_m3u")
+        if last_m3u:
+            try:
+                path = Path(last_m3u)
+                if path.exists():
+                    self._last_m3u = path
+            except (TypeError, ValueError, OSError):
+                self._last_m3u = None
+        last_station = config.get("last_station")
+        self._last_station_url = str(last_station) if last_station else None
 
     def _save_user_config(self) -> None:
         """Salva config utente."""
-        save_config({
-            "volume": self.state.volume,
-            "show_song_popups": self.state.show_song_popups,
-            "logging_enabled": self.logging_enabled,
-            "last_m3u": str(self.m3u_file_path) if self.m3u_file_path else None,
-            "favorites": list(self.favorites),
-            "group_filter": self.group_filter,
-            "eq_preset_idx": self.eq_preset_idx,
-        })
+        m3u_path = self.m3u_file_path or self._last_m3u
+        selected_url = None
+        if 0 <= self.state.selected_station_index < len(self.stations):
+            selected_url = self.stations[self.state.selected_station_index].url
+        with self._config_lock:
+            save_config({
+                "volume": self.state.volume,
+                "show_song_popups": self.state.show_song_popups,
+                "logging_enabled": self.logging_enabled,
+                "last_m3u": str(m3u_path) if m3u_path else None,
+                "last_station": selected_url or self._last_station_url,
+                "favorites": list(self.favorites),
+                "favorites_only": self.show_favorites_only,
+                "group_filter": self.group_filter,
+                "eq_preset_idx": self.eq_preset_idx,
+            })
 
-    def _submit_worker(self, fn, *args, **kwargs):
-        """Sottomette un task all'executor se ancora aperto, altrimenti no-op."""
-        if self.running and not self._executor_closed:
-            try:
-                return self.executor.submit(fn, *args, **kwargs)
-            except RuntimeError:
-                pass
-        return None
+    def _schedule_config_save(self, delay: float = 1.0) -> None:
+        """Salva la config dopo un breve ritardo (evita I/O a ogni tasto)."""
+        if self._config_save_timer is not None:
+            self._config_save_timer.cancel()
+        timer = threading.Timer(delay, self._save_user_config)
+        timer.daemon = True
+        timer.start()
+        self._config_save_timer = timer
+
+    def _cancel_config_save(self) -> None:
+        if self._config_save_timer is not None:
+            self._config_save_timer.cancel()
+            self._config_save_timer = None
+
+    def _spawn_thread(self, target, *args, name: str = "RadioPlayer") -> Optional[threading.Thread]:
+        """Avvia un thread demone dedicato (i loop non devono occupare l'executor)."""
+        if not self.running:
+            return None
+        thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+        thread.start()
+        return thread
+
+    def _invalidate_filtered(self) -> None:
+        """Invalida la cache della lista visibile."""
+        self._filtered_cache = None
+        self._filtered_positions = {}
+
+    def _get_visible_entries(self) -> List[Tuple[int, RadioStation]]:
+        """Restituisce (indice_globale, stazione) per la vista corrente."""
+        if self._filtered_cache is not None:
+            return self._filtered_cache
+
+        query = self.local_search_query.lower() if self.local_search_mode else ""
+        entries: List[Tuple[int, RadioStation]] = []
+        for i, station in enumerate(self.stations):
+            if self.group_filter and station.group != self.group_filter:
+                continue
+            if self.show_favorites_only and station.url not in self.favorites:
+                continue
+            if query and query not in station.name.lower():
+                continue
+            entries.append((i, station))
+
+        self._filtered_cache = entries
+        self._filtered_positions = {i: pos for pos, (i, _) in enumerate(entries)}
+        return entries
+
+    def _ensure_selection_visible(self) -> None:
+        """Se la selezione e' fuori dalla vista filtrata, punta alla prima riga."""
+        entries = self._get_visible_entries()
+        if not entries:
+            return
+        if self.state.selected_station_index not in self._filtered_positions:
+            self.state.selected_station_index = entries[0][0]
+            self.pending_updates |= UpdateFlags.STATIONS
 
     def load_m3u(self, file_path: Path) -> bool:
         """Carica file M3U"""
@@ -186,9 +291,24 @@ class RadioPlayer(RichUIMixin):
                 logger.warning("Nessuna stazione trovata nel file M3U")
                 return False
 
-            self.m3u_file_path = file_path
+            self.m3u_file_path = file_path.resolve()
+            self._last_m3u = self.m3u_file_path
+            self._invalidate_filtered()
+            self._refresh_groups()
+            if self.group_filter and self.group_filter not in self.available_groups:
+                self.group_filter = None
+            self.state.selected_station_index = max(
+                0, min(self.state.selected_station_index, len(self.stations) - 1)
+            )
+            if self._last_station_url:
+                for i, station in enumerate(self.stations):
+                    if station.url == self._last_station_url:
+                        self.state.selected_station_index = i
+                        break
+            self._ensure_selection_visible()
             logger.info(f"Caricate {len(self.stations)} stazioni da {file_path}")
             self.pending_updates |= UpdateFlags.FULL
+            self._save_user_config()
             return True
 
         except Exception as e:
@@ -197,6 +317,8 @@ class RadioPlayer(RichUIMixin):
 
     def _on_metadata_update(self, key: str, value: str):
         """Callback per aggiornamenti metadata"""
+        if not self.state.is_playing:
+            return
         logger.info(f"Metadata update: {key} = {value}")
 
         if key == 'bitrate':
@@ -211,6 +333,14 @@ class RadioPlayer(RichUIMixin):
                 return
 
             if ' - ' in value:
+                station_name = self._playing_station_name()
+                if station_name and value.lower().startswith(station_name.lower() + " - "):
+                    # Alcune radio prefissano il titolo con il proprio nome:
+                    # "Virgin Radio - Style Rock" -> "Style Rock".
+                    value = value[len(station_name) + 3:].strip()
+                    if not value:
+                        return
+
                 artist, song = value.split(' - ', 1)
                 artist = artist.strip()
                 song = song.strip()
@@ -225,8 +355,8 @@ class RadioPlayer(RichUIMixin):
                         total_pause_time=0.0,
                     )
 
-                    if self.state.playing_station_index >= 0:
-                        station_name = self.stations[self.state.playing_station_index].name
+                    if self.state.playing_station_index >= 0 or self._preview_station:
+                        station_name = self._playing_station_name() or "Anteprima"
                         self.history.add(artist, song, station_name)
 
                     if self.state.show_song_popups and old_title and value != self._last_notified_title:
@@ -248,8 +378,8 @@ class RadioPlayer(RichUIMixin):
                         total_pause_time=0.0,
                     )
 
-                    if self.state.playing_station_index >= 0:
-                        station_name = self.stations[self.state.playing_station_index].name
+                    if self.state.playing_station_index >= 0 or self._preview_station:
+                        station_name = self._playing_station_name() or "Anteprima"
                         self.history.add("", value, station_name)
 
                     if self.state.show_song_popups and old_title and value != self._last_notified_title:
@@ -276,46 +406,97 @@ class RadioPlayer(RichUIMixin):
                 except ImportError:
                     pass
             else:
-                subprocess.run(
+                # Popen: non bloccare il thread dei metadata con notify-send.
+                proc = subprocess.Popen(
                     ['notify-send', '\U0001f3b5 Radio Player', message,
                      '--icon=audio-x-generic', '--expire-time=4000'],
-                    check=True, capture_output=True, timeout=2,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
+                threading.Thread(target=proc.wait, daemon=True).start()
         except Exception:
             logger.debug("Notifica fallita")
+
+    def _current_stream_url(self) -> Optional[str]:
+        """URL dello stream attualmente in riproduzione."""
+        if self._preview_station is not None:
+            return self._preview_station.url
+        idx = self.state.playing_station_index
+        if 0 <= idx < len(self.stations):
+            return self.stations[idx].url
+        return None
+
+    def _playing_station_name(self) -> Optional[str]:
+        """Nome della stazione in riproduzione (anche in anteprima)."""
+        if self._preview_station is not None:
+            return self._preview_station.name
+        idx = self.state.playing_station_index
+        if 0 <= idx < len(self.stations):
+            return self.stations[idx].name
+        return None
+
+    def _apply_eq(self) -> None:
+        """Applica il preset EQ corrente allo stream appena avviato."""
+        if self.eq_preset_idx:
+            self.mpv_controller.ipc_client.send_command(
+                "af", "set", self.eq_presets[self.eq_preset_idx]
+            )
 
     def play_selected(self):
         """Avvia riproduzione della stazione selezionata"""
         if not self.stations:
             return
 
-        station = self.stations[self.state.selected_station_index]
+        entries = self._get_visible_entries()
+        if not entries:
+            self.show_temp_message("\U0001f4fb Nessuna stazione visibile con i filtri attivi")
+            return
+
+        idx = self.state.selected_station_index
+        if not 0 <= idx < len(self.stations) or idx not in self._filtered_positions:
+            self.show_temp_message("\U0001f4fb Seleziona una stazione visibile")
+            return
+        station = self.stations[idx]
         logger.info(f"Play stazione: {station.name}")
 
         self.stop()
 
-        if self.mpv_controller.start(station.url, self.state.volume):
-            self.state.is_playing = True
-            self.state.is_paused = False
-            self.state.playing_station_index = self.state.selected_station_index
-            self.state.stream_info = StreamInfo(
-                start_time=time.time(),
-                song_start_time=time.time(),
-            )
-
-            self.metadata_monitor.start(station.url)
-            self._submit_worker(self.metadata_monitor.monitor_loop)
-            self._submit_worker(self._stats_monitor_loop)
-
-            self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG | UpdateFlags.STATIONS
-
-            logger.info("Riproduzione avviata")
-            self.tray.update()
-        else:
+        if not self.mpv_controller.start(station.url, self.state.volume):
+            self.show_temp_message(f"\u274c Impossibile riprodurre {station.name}")
             logger.error("Impossibile avviare riproduzione")
+            return
+
+        self._play_generation += 1
+        self._icy_fallback_started = False
+        self.metadata_monitor.received_title = False
+        self._play_started_at = time.time()
+
+        self.state.is_playing = True
+        self.state.is_paused = False
+        self.state.playing_station_index = idx
+        self.state.stream_info = StreamInfo(
+            start_time=time.time(),
+            song_start_time=time.time(),
+        )
+
+        self.mpv_controller.set_mute(self.state.is_muted)
+        self._apply_eq()
+
+        # I metadata vengono letti da mpv; il monitor ICY parte solo come
+        # fallback se mpv non espone alcun titolo (evita un secondo stream).
+        self._spawn_thread(
+            self._stats_monitor_loop, self._play_generation, name="StatsMonitor"
+        )
+
+        self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG | UpdateFlags.STATIONS
+        logger.info("Riproduzione avviata")
+        self.tray.update()
 
     def stop(self):
         """Ferma riproduzione. MPV e' SEMPRE ucciso (anche se lo stato e' desync)."""
+        self._play_generation += 1
+        self._icy_fallback_started = False
+        self.metadata_monitor.received_title = False
         if self.is_recording:
             self.stop_recording()
         self.metadata_monitor.stop()
@@ -330,6 +511,23 @@ class RadioPlayer(RichUIMixin):
         self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG | UpdateFlags.STATIONS
         self.tray.update()
 
+    def stop_playback(self):
+        """Comando esplicito di stop con feedback in UI."""
+        if not self.state.is_playing:
+            self.show_temp_message("\u23f9 Nessuna riproduzione attiva")
+            return
+        self.stop()
+        self.show_temp_message("\u23f9 Riproduzione fermata")
+
+    def next_station(self, delta: int):
+        """Cambia stazione e, se stava suonando, avvia subito la nuova."""
+        if not self.stations:
+            return
+        was_playing = self.state.is_playing
+        self.change_selection(delta)
+        if was_playing:
+            self.play_selected()
+
     def toggle_play_pause(self):
         """Toggle play/pause"""
         if not self.stations:
@@ -337,28 +535,35 @@ class RadioPlayer(RichUIMixin):
 
         if not self.state.is_playing:
             self.play_selected()
+        elif self.state.playing_station_index != self.state.selected_station_index:
+            self.play_selected()
+        elif self.state.is_paused:
+            if not self.mpv_controller.set_pause(False):
+                self.show_temp_message("\u274c Impossibile riprendere lo stream")
+                return
+            self.state.is_paused = False
+            extra_pause = (
+                time.time() - self.state.stream_info.pause_start_time
+                if self.state.stream_info.pause_start_time else 0
+            )
+            self.state.stream_info = self.state.stream_info.replace(
+                total_pause_time=self.state.stream_info.total_pause_time + extra_pause,
+                pause_start_time=None,
+            )
+            self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG
+            logger.info("Riproduzione ripresa")
+            self.tray.update()
         else:
-            if self.state.playing_station_index != self.state.selected_station_index:
-                self.play_selected()
-            else:
-                if self.state.is_paused:
-                    self.state.is_paused = False
-                    extra_pause = time.time() - self.state.stream_info.pause_start_time if self.state.stream_info.pause_start_time else 0
-                    self.state.stream_info = self.state.stream_info.replace(
-                        total_pause_time=self.state.stream_info.total_pause_time + extra_pause,
-                        pause_start_time=None,
-                    )
-                    self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG
-                    logger.info("Riproduzione ripresa")
-                    self.tray.update()
-                else:
-                    self.state.is_paused = True
-                    self.state.stream_info = self.state.stream_info.replace(
-                        pause_start_time=time.time(),
-                    )
-                    self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG
-                    logger.info("Riproduzione in pausa")
-                    self.tray.update()
+            if not self.mpv_controller.set_pause(True):
+                self.show_temp_message("\u274c Impossibile mettere in pausa")
+                return
+            self.state.is_paused = True
+            self.state.stream_info = self.state.stream_info.replace(
+                pause_start_time=time.time(),
+            )
+            self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG
+            logger.info("Riproduzione in pausa")
+            self.tray.update()
 
     def change_volume(self, delta: int):
         """Cambia volume"""
@@ -370,7 +575,7 @@ class RadioPlayer(RichUIMixin):
         self.pending_updates |= UpdateFlags.TIMER
         logger.debug(f"Volume: {self.state.volume}%")
         self.tray.update()
-        self._save_user_config()
+        self._schedule_config_save()
 
     def toggle_mute(self):
         """Toggle muto"""
@@ -384,22 +589,43 @@ class RadioPlayer(RichUIMixin):
         self.tray.update()
 
     def change_selection(self, delta: int):
-        """Cambia stazione selezionata"""
+        """Cambia stazione selezionata muovendosi nella lista visibile."""
         if not self.stations:
             return
+        entries = self._get_visible_entries()
+        if not entries:
+            return
 
-        self.state.selected_station_index = (
-            self.state.selected_station_index + delta
-        ) % len(self.stations)
+        current = self.state.selected_station_index
+        pos = self._filtered_positions.get(current)
+        if pos is None:
+            new_idx = entries[0][0] if delta >= 0 else entries[-1][0]
+        else:
+            new_idx = entries[(pos + delta) % len(entries)][0]
 
+        self.state.selected_station_index = new_idx
         self.pending_updates |= UpdateFlags.STATIONS
 
     def select_by_number(self, number: int):
-        """Seleziona stazione per numero"""
-        if 1 <= number <= len(self.stations):
-            self.state.selected_station_index = number - 1
-            self.pending_updates |= UpdateFlags.STATIONS
-            logger.debug(f"Selezionata stazione #{number}")
+        """Seleziona stazione per numero globale."""
+        if not 1 <= number <= len(self.stations):
+            return
+        self.state.selected_station_index = number - 1
+        if self.state.selected_station_index not in self._get_visible_positions():
+            # Il numero e' valido ma nascosto dai filtri: mostralo.
+            self.group_filter = None
+            self.show_favorites_only = False
+            if self.local_search_mode:
+                self.local_search_mode = False
+                self.local_search_query = ""
+            self._invalidate_filtered()
+            self.show_temp_message("\U0001f4cb Filtri rimossi per mostrare la stazione")
+        self.pending_updates |= UpdateFlags.STATIONS | UpdateFlags.FULL
+        logger.debug(f"Selezionata stazione #{number}")
+
+    def _get_visible_positions(self) -> dict:
+        self._get_visible_entries()
+        return self._filtered_positions
 
     def toggle_notifications(self):
         """Toggle notifiche cambio brano"""
@@ -442,19 +668,39 @@ class RadioPlayer(RichUIMixin):
         if self.is_recording or not self.state.is_playing:
             return
 
-        station = self.stations[self.state.playing_station_index]
+        stream_url = self._current_stream_url()
+        if not stream_url:
+            self.show_temp_message("\u274c Nessuno stream da registrare")
+            return
+
+        if self._preview_station is not None:
+            display_name = self._preview_station.name
+        elif 0 <= self.state.playing_station_index < len(self.stations):
+            display_name = self.stations[self.state.playing_station_index].name
+        else:
+            display_name = "stream"
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        station_name = re.sub(r'[^\w\s-]', '', station.name)[:30]
+        station_name = re.sub(r'[^\w\s-]', '', display_name)[:30].strip() or "stream"
 
-        self.recording_file = Path(f"recording_{station_name}_{timestamp}.mp3")
+        codec = (self.state.stream_info.codec or "").lower()
+        if ".m3u8" in stream_url.lower():
+            extension = ".ts"
+        else:
+            extension = {
+                "mp3": ".mp3",
+                "aac": ".aac",
+                "opus": ".opus",
+                "vorbis": ".ogg",
+            }.get(codec, ".mka")
+        self.recording_file = Path(f"recording_{station_name}_{timestamp}{extension}")
 
+        # ffmpeg scrive su disco in streaming ed e' la scelta piu' affidabile.
+        # Se manca o fallisce subito, si usa stream-record di mpv.
         try:
-            # ffmpeg apre una seconda connessione allo stream per registrare.
-            # Questo raddoppia la banda ma garantisce una registrazione
-            # indipendente dal player (se MPV ha glitch, il file e' pulito).
             cmd = [
                 'ffmpeg',
-                '-i', station.url,
+                '-i', stream_url,
                 '-c', 'copy',
                 '-y',
                 str(self.recording_file),
@@ -466,17 +712,48 @@ class RadioPlayer(RichUIMixin):
                 stderr=subprocess.DEVNULL,
             )
 
+            # ffmpeg puo' uscire subito (URL/TLS non validi): in quel caso
+            # proviamo la registrazione tramite la connessione mpv gia' aperta.
+            time.sleep(0.3)
+            if self.recording_process.poll() is not None:
+                logger.warning("ffmpeg terminato subito, provo stream-record di mpv")
+                self.recording_process = None
+                if self._start_mpv_recording():
+                    return
+                self.show_temp_message("\u274c Registrazione non avviata (ffmpeg/mpv)")
+                return
+
+            self._recording_via_mpv = False
             self.is_recording = True
             self.pending_updates |= UpdateFlags.STATUS
             self.show_temp_message(f"\U0001f534 Registrazione avviata: {self.recording_file.name}")
-            logger.info(f"Registrazione avviata: {self.recording_file}")
+            logger.info(f"Registrazione avviata via ffmpeg: {self.recording_file}")
 
         except FileNotFoundError:
-            self.show_temp_message("\u274c ffmpeg non installato (apt install ffmpeg)")
-            logger.error("ffmpeg non disponibile per registrazione")
+            if not self._start_mpv_recording():
+                self.show_temp_message("\u274c ffmpeg non installato (apt install ffmpeg)")
+                logger.error("ffmpeg non disponibile per registrazione")
         except Exception as e:
             self.show_temp_message(f"\u274c Errore registrazione: {e}")
             logger.error(f"Errore avvio registrazione: {e}")
+
+    def _start_mpv_recording(self) -> bool:
+        """Avvia la registrazione usando la connessione mpv gia' attiva."""
+        if self.recording_file is None or not self.mpv_controller.is_running():
+            return False
+        if not self.mpv_controller.ipc_client.set_property(
+            "stream-record", str(self.recording_file)
+        ):
+            return False
+
+        self._recording_via_mpv = True
+        self.is_recording = True
+        self.pending_updates |= UpdateFlags.STATUS
+        self.show_temp_message(
+            f"\U0001f534 Registrazione avviata: {self.recording_file.name}"
+        )
+        logger.info(f"Registrazione avviata via mpv: {self.recording_file}")
+        return True
 
     def stop_recording(self):
         """Ferma registrazione"""
@@ -484,7 +761,11 @@ class RadioPlayer(RichUIMixin):
             return
 
         try:
-            if self.recording_process:
+            if self._recording_via_mpv:
+                self.mpv_controller.ipc_client.set_property("stream-record", "")
+                self._recording_via_mpv = False
+                time.sleep(0.5)
+            elif self.recording_process:
                 self.recording_process.terminate()
                 try:
                     self.recording_process.wait(timeout=2)
@@ -530,50 +811,86 @@ class RadioPlayer(RichUIMixin):
     # ========================================================================
 
     def _get_filtered_stations(self):
-        """Restituisce le stazioni filtrate per gruppo e/o ricerca locale."""
-        stations = self.stations
-        if self.group_filter:
-            stations = [s for s in stations if s.group == self.group_filter]
-        if self.local_search_mode and self.local_search_query:
-            query = self.local_search_query.lower()
-            stations = [s for s in stations if query in s.name.lower()]
-        return stations
+        """Restituisce le stazioni filtrate per gruppo/preferiti/ricerca."""
+        return [station for _, station in self._get_visible_entries()]
 
     def _refresh_groups(self):
         """Aggiorna la lista dei gruppi disponibili."""
-        groups = set()
-        for s in self.stations:
-            groups.add(s.group)
-        self.available_groups = sorted(groups)
+        self.available_groups = sorted({s.group for s in self.stations})
 
-    def cycle_group_filter(self):
-        """Cicla il filtro per gruppo."""
+    def _group_choices(self):
+        return [None] + self.available_groups
+
+    def open_group_picker(self):
+        """Apre il selettore dei gruppi (invece del ciclo alla cieca)."""
         self._refresh_groups()
         if not self.available_groups:
-            self.group_filter = None
             self.show_temp_message("\U0001f4cb Nessun gruppo trovato")
             return
-        if self.group_filter is None:
-            self.group_filter = self.available_groups[0]
-        else:
-            try:
-                idx = self.available_groups.index(self.group_filter)
-                next_idx = (idx + 1) % (len(self.available_groups) + 1)
-                if next_idx == len(self.available_groups):
-                    self.group_filter = None
-                else:
-                    self.group_filter = self.available_groups[next_idx]
-            except ValueError:
-                self.group_filter = self.available_groups[0]
-        label = self.group_filter or "Tutti"
+        choices = self._group_choices()
+        try:
+            self.group_overlay_idx = choices.index(self.group_filter)
+        except ValueError:
+            self.group_overlay_idx = 0
+        self.show_group_overlay = True
+        self.pending_updates |= UpdateFlags.FULL
+
+    def close_group_picker(self):
+        self.show_group_overlay = False
+        self.pending_updates |= UpdateFlags.FULL
+
+    def move_group_selection(self, delta: int):
+        choices = self._group_choices()
+        if not choices:
+            return
+        self.group_overlay_idx = (self.group_overlay_idx + delta) % len(choices)
+
+    def _apply_group_filter(self, group: Optional[str]):
+        self.group_filter = group
+        self.show_group_overlay = False
+        self._invalidate_filtered()
+        self._ensure_selection_visible()
+        label = group or "Tutti i gruppi"
         self.show_temp_message(f"\U0001f4cb Gruppo: {label}")
-        self.state.selected_station_index = 0
+        self.pending_updates |= UpdateFlags.FULL
+        self._save_user_config()
+
+    def confirm_group_selection(self):
+        choices = self._group_choices()
+        if choices:
+            self._apply_group_filter(choices[self.group_overlay_idx % len(choices)])
+
+    def cycle_group_filter(self):
+        """Cicla rapidamente il filtro per gruppo."""
+        self._refresh_groups()
+        choices = self._group_choices()
+        if len(choices) == 1:
+            self.show_temp_message("\U0001f4cb Nessun gruppo trovato")
+            return
+        try:
+            idx = choices.index(self.group_filter)
+        except ValueError:
+            idx = 0
+        self._apply_group_filter(choices[(idx + 1) % len(choices)])
+
+    def toggle_favorites_only(self):
+        """Mostra/nasconde solo le stazioni preferite."""
+        self.show_favorites_only = not self.show_favorites_only
+        self._invalidate_filtered()
+        self._ensure_selection_visible()
+        status = "ON" if self.show_favorites_only else "OFF"
+        if self.show_favorites_only and not self._get_visible_entries():
+            self.show_temp_message("\u2b50 Nessun preferito: usa * per aggiungerne")
+        else:
+            self.show_temp_message(f"\u2b50 Solo preferiti: {status}")
         self.pending_updates |= UpdateFlags.FULL
         self._save_user_config()
 
     def toggle_favorite(self):
         """Aggiunge/rimuove stazione selezionata dai preferiti."""
         if not self.stations:
+            return
+        if not 0 <= self.state.selected_station_index < len(self.stations):
             return
         station = self.stations[self.state.selected_station_index]
         if station.url in self.favorites:
@@ -582,6 +899,8 @@ class RadioPlayer(RichUIMixin):
         else:
             self.favorites.add(station.url)
             self.show_temp_message(f"\u2b50 Preferita: {station.name}")
+        self._invalidate_filtered()
+        self._ensure_selection_visible()
         self.pending_updates |= UpdateFlags.STATIONS
         self._save_user_config()
 
@@ -589,24 +908,24 @@ class RadioPlayer(RichUIMixin):
         """Entra in modalita' ricerca locale nel M3U."""
         self.local_search_mode = True
         self.local_search_query = ""
+        self._invalidate_filtered()
         self.pending_updates |= UpdateFlags.FULL
 
     def exit_local_search_mode(self):
         """Esce dalla modalita' ricerca locale."""
         self.local_search_mode = False
         self.local_search_query = ""
+        self._invalidate_filtered()
+        self._ensure_selection_visible()
         self.pending_updates |= UpdateFlags.FULL
 
     def _update_local_search(self):
-        """Aggiorna la selezione in base alla ricerca locale."""
-        query = self.local_search_query.lower()
-        if not query:
-            return
-        for i, s in enumerate(self.stations):
-            if query in s.name.lower():
-                self.state.selected_station_index = i
-                break
-        self.pending_updates |= UpdateFlags.STATIONS
+        """Aggiorna filtro e selezione in base alla ricerca locale."""
+        self._invalidate_filtered()
+        entries = self._get_visible_entries()
+        if entries:
+            self.state.selected_station_index = entries[0][0]
+        self.pending_updates |= UpdateFlags.STATIONS | UpdateFlags.INPUT
 
     def cycle_eq(self):
         """Cicla tra i preset di equalizzazione."""
@@ -624,29 +943,50 @@ class RadioPlayer(RichUIMixin):
         self.pending_updates |= UpdateFlags.FULL
 
     def jump_to_letter(self, letter: str):
-        """Salta alla prima stazione (dalla corrente, con wrap) che inizia con la lettera."""
+        """Salta alla prossima stazione visibile che inizia con la lettera."""
         if not self.stations:
             return
+        entries = self._get_visible_entries()
+        if not entries:
+            return
         letter = letter.lower()
-        n = len(self.stations)
-        for offset in range(1, n + 1):
-            idx = (self.state.selected_station_index + offset) % n
-            if self.stations[idx].name.lower().startswith(letter):
+        pos = self._filtered_positions.get(self.state.selected_station_index, 0)
+        for offset in range(1, len(entries) + 1):
+            idx, station = entries[(pos + offset) % len(entries)]
+            if station.name.lower().startswith(letter):
                 self.state.selected_station_index = idx
                 self.pending_updates |= UpdateFlags.STATIONS
-                self.show_temp_message(f"\U0001f50d {letter.upper()}: {self.stations[idx].name}")
+                self.show_temp_message(f"\U0001f50d {letter.upper()}: {station.name}")
                 return
-        # Nessuna stazione trovata
         self.show_temp_message(f"\U0001f50d Nessuna stazione con {letter.upper()}")
 
+    def cancel_pending_delete(self):
+        if self._pending_delete is not None:
+            self._pending_delete = None
+            self.show_temp_message("Eliminazione annullata")
+
     def remove_selected_station(self):
-        """Rimuove la stazione selezionata dalla lista e dal file M3U."""
+        """Rimuove la stazione selezionata, con doppia conferma."""
         if not self.stations or not self.m3u_file_path:
             self.show_temp_message("\u274c Nessuna stazione da rimuovere")
             return
         idx = self.state.selected_station_index
         if idx < 0 or idx >= len(self.stations):
             return
+
+        now = time.time()
+        pending = self._pending_delete
+        if pending and pending[0] == idx and now - pending[1] <= 3.0:
+            self._pending_delete = None
+            self._delete_station(idx)
+            return
+
+        self._pending_delete = (idx, now)
+        self.show_temp_message(
+            f"\u26a0\ufe0f  Premi 'd' di nuovo per eliminare '{self.stations[idx].name}'"
+        )
+
+    def _delete_station(self, idx: int):
         station = self.stations[idx]
         name = station.name
 
@@ -657,33 +997,63 @@ class RadioPlayer(RichUIMixin):
 
         self.favorites.discard(station.url)
         self.stations.pop(idx)
+        self._last_deleted = (station, idx, time.time())
+        self._invalidate_filtered()
+        self.state.selected_station_index = min(
+            self.state.selected_station_index, max(0, len(self.stations) - 1)
+        )
+        self._ensure_selection_visible()
 
-        if idx >= len(self.stations):
-            self.state.selected_station_index = max(0, len(self.stations) - 1)
-
-        self._save_m3u_file()
-        self.show_temp_message(f"\U0001f5d1\ufe0f Rimossa: {name}")
+        if self._save_m3u_file():
+            self.show_temp_message(
+                f"\U0001f5d1\ufe0f Rimossa: {name}  (u per annullare)"
+            )
         self.pending_updates |= UpdateFlags.STATIONS | UpdateFlags.STATUS
         self._save_user_config()
 
-    def _save_m3u_file(self):
-        """Riscrive il file M3U con le stazioni correnti."""
-        if not self.m3u_file_path:
+    def undo_delete(self):
+        """Ripristina l'ultima stazione eliminata (entro 15 secondi)."""
+        if self._last_deleted is None:
+            self.show_temp_message("\u21a9\ufe0f Nessuna eliminazione da annullare")
             return
-        lines = ["#EXTM3U\n"]
-        for s in self.stations:
-            attrs = []
-            if s.metadata.get("group-title"):
-                attrs.append(f'group-title="{s.metadata["group-title"]}"')
-            if s.logo:
-                attrs.append(f'tvg-logo="{s.logo}"')
-            attr_str = " " + " ".join(attrs) if attrs else ""
-            lines.append(f"#EXTINF:-1{attr_str},{s.name}\n")
-            lines.append(f"{s.url}\n")
+        station, idx, deleted_at = self._last_deleted
+        if time.time() - deleted_at > 15:
+            self._last_deleted = None
+            self.show_temp_message("\u231b Tempo per annullare scaduto")
+            return
+        if any(s.url == station.url for s in self.stations):
+            self._last_deleted = None
+            self.show_temp_message("\u26a0\ufe0f La stazione e' gia' presente")
+            return
+
+        idx = max(0, min(idx, len(self.stations)))
+        self.stations.insert(idx, station)
+        self.state.selected_station_index = idx
+        self._invalidate_filtered()
+        self._refresh_groups()
+        self._last_deleted = None
+        if self._save_m3u_file():
+            self.show_temp_message(f"\u21a9\ufe0f Ripristinata: {station.name}")
+        self.pending_updates |= UpdateFlags.FULL | UpdateFlags.STATUS
+        self._save_user_config()
+
+    def _save_m3u_file(self) -> bool:
+        """Riscrive il file M3U preservando tutti gli attributi delle stazioni."""
+        if not self.m3u_file_path:
+            return False
+        tmp_path = self.m3u_file_path.with_name(self.m3u_file_path.name + ".tmp")
         try:
-            self.m3u_file_path.write_text("".join(lines), encoding="utf-8")
-        except OSError:
-            pass
+            tmp_path.write_text(M3UParser.serialize(self.stations), encoding="utf-8")
+            os.replace(tmp_path, self.m3u_file_path)
+            return True
+        except OSError as e:
+            logger.error(f"Errore salvataggio M3U: {e}")
+            self.show_temp_message(f"\u274c Errore salvataggio M3U: {e}")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
 
     # ========================================================================
     # RICERCA RADIOBROWSER
@@ -696,6 +1066,11 @@ class RadioPlayer(RichUIMixin):
         self.search_results = []
         self.search_selected_idx = 0
         self.search_loading = False
+        self.search_error = ""
+        self.search_offset = 0
+        self.search_has_more = False
+        self.search_loading_more = False
+        self._last_searched_query = ""
         self.pending_updates |= UpdateFlags.FULL
         logger.info("Entrato in modalita' ricerca RadioBrowser")
 
@@ -714,13 +1089,20 @@ class RadioPlayer(RichUIMixin):
             self._search_timer.cancel()
             self._search_timer = None
 
+        self.search_error = ""
         if not self.search_query.strip():
             self.search_results = []
             self.search_selected_idx = 0
             self.search_loading = False
+            self.search_offset = 0
+            self.search_has_more = False
+            self.search_loading_more = False
             self.pending_updates |= UpdateFlags.STATIONS
             return
 
+        self.search_offset = 0
+        self.search_has_more = False
+        self.search_loading_more = False
         self.search_loading = True
         self.pending_updates |= UpdateFlags.STATIONS
         self._search_timer = threading.Timer(0.3, self._do_search)
@@ -733,18 +1115,71 @@ class RadioPlayer(RichUIMixin):
         if not query.strip():
             return
         try:
-            results = self.radio_browser.search(query)
-            if query == self.search_query:
+            results = self.radio_browser.search(query, limit=20, offset=0)
+            if query == self.search_query and self.search_mode:
                 self.search_results = results
                 self.search_selected_idx = 0
                 self.search_loading = False
+                self.search_error = "" if results else (self.radio_browser.last_error or "")
+                self.search_offset = 20 if len(results) >= 20 else len(results)
+                self.search_has_more = len(results) >= 20
                 self._last_searched_query = query
                 self.pending_updates |= UpdateFlags.STATIONS
         except Exception as e:
             logger.error(f"Errore ricerca: {e}")
             self.search_loading = False
+            self.search_error = str(e)
+            self.search_has_more = False
             self._last_searched_query = query
             self.pending_updates |= UpdateFlags.STATIONS
+
+    def load_more_search(self):
+        """Carica la pagina successiva dei risultati RadioBrowser."""
+        if (
+            self.search_loading
+            or self.search_loading_more
+            or not self.search_has_more
+            or not self.search_query.strip()
+        ):
+            return
+        self.search_loading_more = True
+        self.pending_updates |= UpdateFlags.STATIONS
+        self._spawn_thread(self._do_search_more, name="SearchMore")
+
+    def _do_search_more(self):
+        """Carica altri 20 risultati e li accoda a quelli esistenti."""
+        query = self.search_query
+        offset = self.search_offset
+        try:
+            results = self.radio_browser.search(query, limit=20, offset=offset)
+        except Exception as e:
+            logger.error(f"Errore ricerca (altri risultati): {e}")
+            self.search_loading_more = False
+            self.search_error = str(e)
+            self.pending_updates |= UpdateFlags.STATIONS
+            return
+
+        if query != self.search_query or not self.search_mode:
+            self.search_loading_more = False
+            return
+
+        existing = {s.url.rstrip("/") for s in self.search_results}
+        added = 0
+        for station in results:
+            key = station.url.rstrip("/")
+            if key not in existing:
+                self.search_results.append(station)
+                existing.add(key)
+                added += 1
+
+        self.search_offset += len(results)
+        self.search_has_more = len(results) >= 20
+        self.search_loading_more = False
+        if self.radio_browser.last_error and not results:
+            self.search_error = self.radio_browser.last_error
+        elif added == 0 and results:
+            self.show_temp_message("\u2139\ufe0f Nessun nuovo risultato")
+        self.pending_updates |= UpdateFlags.STATIONS
 
     def play_preview(self, station: RadioStation):
         """Ascolta anteprima senza aggiungere al M3U. Toggle: p ferma se gia' attiva."""
@@ -753,23 +1188,32 @@ class RadioPlayer(RichUIMixin):
             self.show_temp_message("\u23f9 Anteprima fermata")
             return
         self.stop()
-        if self.mpv_controller.start(station.url, self.state.volume):
-            self.state.is_playing = True
-            self.state.is_paused = False
-            self.state.playing_station_index = -1
-            self._preview_station = station
-            self.state.stream_info = StreamInfo(
-                start_time=time.time(),
-                song_start_time=time.time(),
-            )
-            self.metadata_monitor.start(station.url)
-            self._submit_worker(self.metadata_monitor.monitor_loop)
-            self._submit_worker(self._stats_monitor_loop)
-            self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG
-            self.show_temp_message(f"\U0001f442 Anteprima: {station.name}")
-            logger.info(f"Preview: {station.name}")
-        else:
+
+        if not self.mpv_controller.start(station.url, self.state.volume):
             self.show_temp_message("\u274c Impossibile avviare anteprima")
+            return
+
+        self._play_generation += 1
+        self._icy_fallback_started = False
+        self.metadata_monitor.received_title = False
+        self._play_started_at = time.time()
+        self.state.is_playing = True
+        self.state.is_paused = False
+        self.state.playing_station_index = -1
+        self._preview_station = station
+        self.state.stream_info = StreamInfo(
+            start_time=time.time(),
+            song_start_time=time.time(),
+        )
+
+        self.mpv_controller.set_mute(self.state.is_muted)
+        self._apply_eq()
+        self._spawn_thread(
+            self._stats_monitor_loop, self._play_generation, name="StatsMonitor"
+        )
+        self.pending_updates |= UpdateFlags.STATUS | UpdateFlags.SONG
+        self.show_temp_message(f"\U0001f442 Anteprima: {station.name}")
+        logger.info(f"Preview: {station.name}")
 
     def add_station_to_m3u(self, station: RadioStation) -> bool:
         """Aggiunge la stazione al file M3U evitando duplicati (URL e nome)"""
@@ -778,29 +1222,34 @@ class RadioPlayer(RichUIMixin):
             return False
 
         station_url = station.url.rstrip("/")
-        for existing in self.stations:
-            if existing.url.rstrip("/") == station_url:
-                self.show_temp_message(f"\u26a0\ufe0f  Gia' presente: {existing.name}")
-                return False
+        existing_urls = {s.url.rstrip("/") for s in self.stations}
+        if station_url in existing_urls:
+            existing = next(s for s in self.stations if s.url.rstrip("/") == station_url)
+            self.show_temp_message(f"\u26a0\ufe0f  Gia' presente: {existing.name}")
+            return False
 
         station_name_lc = station.name.strip().lower()
-        for existing in self.stations:
-            if existing.name.strip().lower() == station_name_lc:
-                self.show_temp_message(f"\u26a0\ufe0f  Nome gia' presente: {existing.name}")
-                return False
+        existing_names = {s.name.strip().lower(): s for s in self.stations}
+        if station_name_lc in existing_names:
+            existing = existing_names[station_name_lc]
+            self.show_temp_message(f"\u26a0\ufe0f  Nome gia' presente: {existing.name}")
+            return False
 
         try:
             try:
-                content = self.m3u_file_path.read_text(encoding="utf-8")
+                content = self.m3u_file_path.read_text(encoding="utf-8-sig")
             except UnicodeDecodeError:
                 content = self.m3u_file_path.read_text(encoding="latin-1")
 
             with open(self.m3u_file_path, "a", encoding="utf-8") as f:
                 if content and not content.endswith("\n"):
                     f.write("\n")
-                f.write(f"#EXTINF:-1,{station.name}\n{station.url}\n")
+                f.write(M3UParser.format_extinf(station) + "\n")
+                f.write(station.url + "\n")
 
             self.stations.append(station)
+            self._invalidate_filtered()
+            self._refresh_groups()
             self.pending_updates |= UpdateFlags.STATIONS
             self.show_temp_message(f"\u2705 Aggiunta: {station.name}")
             logger.info(f"Aggiunta al M3U: {station.name} \u2014 {station.url}")
@@ -811,20 +1260,28 @@ class RadioPlayer(RichUIMixin):
             logger.error(f"Errore aggiunta stazione: {e}")
             return False
 
-    def _stats_monitor_loop(self):
-        """Loop monitoraggio statistiche MPV e METADATA"""
+    def _stats_monitor_loop(self, generation: int):
+        """Loop monitoraggio statistiche MPV e metadata."""
         logger.info("Avviato monitor statistiche")
+        errors = 0
 
-        while self.state.is_playing and self.mpv_controller.is_running():
+        while (
+            self.state.is_playing
+            and generation == self._play_generation
+            and self.mpv_controller.is_running()
+        ):
             try:
-                if self.state.is_paused:
-                    self.mpv_controller.set_mute(True)
-                elif self.state.is_muted:
-                    self.mpv_controller.set_mute(True)
-                else:
-                    self.mpv_controller.set_mute(False)
-
                 stats = self.mpv_controller.get_audio_stats()
+
+                if (
+                    self.is_recording
+                    and not self._recording_via_mpv
+                    and self.recording_process is not None
+                    and self.recording_process.poll() is not None
+                ):
+                    self.is_recording = False
+                    self.recording_process = None
+                    self.show_temp_message("\u274c Registrazione interrotta (ffmpeg)")
 
                 updates = {}
                 if stats.get('bitrate'):
@@ -834,37 +1291,65 @@ class RadioPlayer(RichUIMixin):
                 if stats.get('cache'):
                     updates['cache_duration'] = stats['cache']
                 if stats.get('buffer_status'):
-                    old_buffer = self.state.stream_info.buffer_status
                     updates['buffer_status'] = stats['buffer_status']
-                    if stats['buffer_status'] == "BUFFERING" and old_buffer != "BUFFERING":
+
+                changed = {
+                    key: value for key, value in updates.items()
+                    if getattr(self.state.stream_info, key, None) != value
+                }
+                if changed:
+                    self.state.stream_info = self.state.stream_info.replace(**changed)
+                    if any(key != "cache_duration" for key in changed):
                         self.pending_updates |= UpdateFlags.TECHNICAL
 
-                if updates:
-                    self.state.stream_info = self.state.stream_info.replace(**updates)
-
-                # FALLBACK metadata via IPC MPV: usato SOLO se il monitor ICY
-                # non sta gia' producendo titoli. Evita che MPV (piu' lento)
-                # riproponga un titolo vecchio, causando notifiche duplicate.
+                # Metadata da mpv (niente seconda connessione allo stream).
+                # Il monitor ICY parte solo se dopo 10s non abbiamo un titolo.
                 if not self.metadata_monitor.received_title:
                     metadata = self.mpv_controller.ipc_client.get_property("metadata")
-
+                    current_title = None
                     if metadata and isinstance(metadata, dict):
-                        current_title = (
-                            metadata.get("icy-title")
-                            or metadata.get("title")
-                            or metadata.get("TITLE")
-                        )
+                        current_title = metadata.get("icy-title")
+                        if not current_title:
+                            media_title = metadata.get("title") or metadata.get("TITLE")
+                            if media_title and " - " in str(media_title):
+                                current_title = media_title
 
-                        if current_title:
-                            current_title = str(current_title).strip()
-                            if current_title and current_title != self.state.stream_info.title:
-                                self._on_metadata_update('stream_title', current_title)
+                    if current_title:
+                        current_title = str(current_title).strip()
+                        if current_title and current_title != self.state.stream_info.title:
+                            self._on_metadata_update('stream_title', current_title)
+                    elif (
+                        not self._icy_fallback_started
+                        and time.time() - self._play_started_at >= 10
+                    ):
+                        url = self._current_stream_url()
+                        if url:
+                            self._icy_fallback_started = True
+                            self.metadata_monitor.start(url)
+                            self._spawn_thread(
+                                self.metadata_monitor.monitor_loop, name="Metadata"
+                            )
+                            logger.info("Avviato fallback metadata ICY")
 
                 time.sleep(2)
+                errors = 0
 
             except Exception as e:
-                logger.error(f"Errore monitor stats: {e}")
-                break
+                errors += 1
+                logger.error(f"Errore monitor stats ({errors}/3): {e}")
+                if errors >= 3:
+                    break
+                time.sleep(2)
+
+        # mpv e' terminato senza che l'utente abbia premuto stop.
+        if (
+            generation == self._play_generation
+            and self.state.is_playing
+            and not self.mpv_controller.is_running()
+        ):
+            logger.warning("Stream terminato inaspettatamente")
+            self.stop()
+            self.show_temp_message("\u274c Stream interrotto")
 
         logger.info("Terminato monitor statistiche")
 
@@ -888,44 +1373,89 @@ class RadioPlayer(RichUIMixin):
         logger.warning(f"Ricevuto segnale {signum}, chiusura in corso...")
         self.running = False
 
-    def setup_terminal(self):
-        """Configura terminale per input raw"""
-        if platform.system() != "Windows":
+    def setup_terminal(self) -> bool:
+        """Configura il terminale per l'input raw. False se non e' un TTY."""
+        if platform.system() == "Windows":
+            return True
+        if not sys.stdin.isatty():
+            return False
+        try:
             self.old_settings = termios.tcgetattr(sys.stdin)
             tty.setcbreak(sys.stdin.fileno())
+            return True
+        except (termios.error, OSError, ValueError):
+            self.old_settings = None
+            return False
 
     def restore_terminal(self):
         """Ripristina terminale"""
         if platform.system() != "Windows" and self.old_settings:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+            except (termios.error, OSError, ValueError):
+                pass
+            self.old_settings = None
+
+    def _read_unix_char(self, fd) -> Optional[str]:
+        """Legge un carattere UTF-8 o una sequenza di escape da stdin."""
+        try:
+            first = os.read(fd, 1)
+        except OSError:
+            return None
+        if not first:
+            return None
+
+        if first == b'\x1b':
+            seq = b""
+            deadline = time.monotonic() + 0.03
+            mapping = {
+                b'[A': 'UP', b'[B': 'DOWN', b'[C': 'RIGHT', b'[D': 'LEFT',
+                b'OA': 'UP', b'OB': 'DOWN', b'OC': 'RIGHT', b'OD': 'LEFT',
+                b'[5~': 'PGUP', b'[6~': 'PGDN',
+                b'[H': 'HOME', b'[F': 'END', b'[1~': 'HOME', b'[4~': 'END',
+                b'OH': 'HOME', b'OF': 'END',
+            }
+            while len(seq) < 6 and time.monotonic() < deadline:
+                if seq in mapping:
+                    break
+                if not select.select([fd], [], [], 0.005)[0]:
+                    break
+                try:
+                    seq += os.read(fd, 1)
+                except OSError:
+                    break
+            return mapping.get(seq, 'ESC')
+
+        data = first
+        if first[0] >= 0xC0:
+            extra = 1 if first[0] < 0xE0 else (2 if first[0] < 0xF0 else 3)
+            for _ in range(extra):
+                try:
+                    data += os.read(fd, 1)
+                except OSError:
+                    break
+        return data.decode('utf-8', errors='ignore')
 
     def get_char(self) -> Optional[str]:
         """Legge carattere da stdin (non bloccante)"""
         if platform.system() == "Windows":
             if msvcrt.kbhit():
-                char = msvcrt.getch().decode('utf-8', errors='ignore')
-                if char == '\xe0':
-                    char = msvcrt.getch().decode('utf-8', errors='ignore')
-                    return {'H': 'UP', 'P': 'DOWN', 'M': 'RIGHT', 'K': 'LEFT'}.get(char)
-                return char if char != '\x1b' else 'ESC'
+                char = msvcrt.getwch()
+                if char in ('\x00', '\xe0'):
+                    code = msvcrt.getwch()
+                    return {
+                        'H': 'UP', 'P': 'DOWN', 'M': 'RIGHT', 'K': 'LEFT',
+                        'I': 'PGUP', 'Q': 'PGDN', 'G': 'HOME', 'O': 'END',
+                    }.get(code)
+                if char == '\x1b':
+                    return 'ESC'
+                return char
             return None
         else:
             fd = sys.stdin.fileno()
             if not select.select([fd], [], [], 0.05)[0]:
                 return None
-            try:
-                char = os.read(fd, 1).decode('utf-8', errors='ignore')
-            except Exception:
-                return None
-            if char == '\x1b':
-                if select.select([fd], [], [], 0.05)[0]:
-                    try:
-                        seq = os.read(fd, 2).decode('utf-8', errors='ignore')
-                        return {'[A': 'UP', '[B': 'DOWN', '[C': 'RIGHT', '[D': 'LEFT'}.get(seq, 'ESC')
-                    except Exception:
-                        pass
-                return 'ESC'
-            return char
+            return self._read_unix_char(fd)
 
     def handle_input(self):
         """Loop gestione input"""
@@ -936,6 +1466,16 @@ class RadioPlayer(RichUIMixin):
                 continue
 
             try:
+                if char == '\x03':  # Ctrl+C su Windows
+                    self.running = False
+                    continue
+
+                if self._pending_delete is not None and char.lower() != 'd':
+                    if char == 'ESC':
+                        self.cancel_pending_delete()
+                        continue
+                    self._pending_delete = None
+
                 if self.search_mode:
                     if char == 'ESC':
                         self.exit_search_mode()
@@ -950,6 +1490,16 @@ class RadioPlayer(RichUIMixin):
                                 len(self.search_results) - 1, self.search_selected_idx + 1
                             )
                             self.pending_updates |= UpdateFlags.STATIONS
+                    elif char == 'PGUP' and self.search_results:
+                        self.search_selected_idx = max(0, self.search_selected_idx - 10)
+                        self.pending_updates |= UpdateFlags.STATIONS
+                    elif char == 'PGDN' and self.search_results:
+                        self.search_selected_idx = min(
+                            len(self.search_results) - 1, self.search_selected_idx + 10
+                        )
+                        self.pending_updates |= UpdateFlags.STATIONS
+                    elif char == '\t':
+                        self.load_more_search()
                     elif char in ('\r', '\n'):
                         if self.search_results and 0 <= self.search_selected_idx < len(self.search_results):
                             self.add_station_to_m3u(self.search_results[self.search_selected_idx])
@@ -1003,23 +1553,38 @@ class RadioPlayer(RichUIMixin):
                         self.pending_updates |= UpdateFlags.INPUT
                     continue
 
+                if self.show_group_overlay:
+                    if char in ('ESC', 'g', 'G'):
+                        self.close_group_picker()
+                    elif char == 'UP':
+                        self.move_group_selection(-1)
+                    elif char == 'DOWN':
+                        self.move_group_selection(1)
+                    elif char in ('\r', '\n'):
+                        self.confirm_group_selection()
+                    continue
+
                 if self.show_help_overlay:
-                    if char.lower() != '?':
+                    if char in ('ESC', '?'):
                         self.show_help_overlay = False
                         self.pending_updates |= UpdateFlags.FULL
-                        continue
+                    continue
 
                 if self.show_history_overlay:
-                    if char.lower() != 'h':
+                    if char in ('ESC', 'h', 'H'):
                         self.show_history_overlay = False
                         self.pending_updates |= UpdateFlags.FULL
-                        continue
+                    continue
 
                 if char.lower() == 'q':
                     logger.info("Richiesta uscita utente")
                     self.running = False
                 elif char.lower() == 'p' or char == ' ' or char in ('\r', '\n'):
                     self.toggle_play_pause()
+                elif char.lower() == 'x':
+                    self.stop_playback()
+                elif char.lower() == 'n':
+                    self.next_station(-1 if char == 'N' else 1)
                 elif char.lower() == 'm':
                     self.toggle_mute()
                 elif char in ('+', '='):
@@ -1030,6 +1595,20 @@ class RadioPlayer(RichUIMixin):
                     self.change_selection(-1)
                 elif char == 'DOWN':
                     self.change_selection(1)
+                elif char == 'PGUP':
+                    self.change_selection(-5)
+                elif char == 'PGDN':
+                    self.change_selection(5)
+                elif char == 'HOME':
+                    entries = self._get_visible_entries()
+                    if entries:
+                        self.state.selected_station_index = entries[0][0]
+                        self.pending_updates |= UpdateFlags.STATIONS
+                elif char == 'END':
+                    entries = self._get_visible_entries()
+                    if entries:
+                        self.state.selected_station_index = entries[-1][0]
+                        self.pending_updates |= UpdateFlags.STATIONS
                 elif char.lower() == 't':
                     self.toggle_notifications()
                 elif char.lower() == 'l':
@@ -1045,12 +1624,26 @@ class RadioPlayer(RichUIMixin):
                     self.show_history()
                 elif char.lower() == 'b':
                     self.enter_search_mode()
-                elif char.lower() == 'g':
+                elif char == 'G':
                     self.cycle_group_filter()
+                elif char.lower() == 'g':
+                    self.open_group_picker()
                 elif char == '*':
                     self.toggle_favorite()
+                elif char.lower() == 'f':
+                    self.toggle_favorites_only()
+                elif char == 'ESC':
+                    if self.group_filter or self.show_favorites_only:
+                        self.group_filter = None
+                        self.show_favorites_only = False
+                        self._invalidate_filtered()
+                        self._ensure_selection_visible()
+                        self.show_temp_message("\U0001f4cb Filtri rimossi")
+                        self.pending_updates |= UpdateFlags.FULL
                 elif char.lower() == 'd':
                     self.remove_selected_station()
+                elif char.lower() == 'u':
+                    self.undo_delete()
                 elif char == '/':
                     self.enter_local_search_mode()
                 elif char.lower() == 'e':
@@ -1067,88 +1660,132 @@ class RadioPlayer(RichUIMixin):
             except Exception as e:
                 logger.error(f"Errore gestione input: {e}", exc_info=True)
 
-    def run(self, m3u_file: Optional[Path] = None):
-        """Loop principale"""
+    def run(self, m3u_file: Optional[Path] = None) -> bool:
+        """Loop principale. Restituisce False se non riesce ad avviarsi."""
+        success = False
+        fatal_error: Optional[str] = None
         try:
             self._install_signal_handlers()
-            self.setup_terminal()
+            if not self.setup_terminal():
+                print("\u274c Radio Player richiede un terminale interattivo (TTY)")
+                return False
 
             if m3u_file:
                 if not self.load_m3u(m3u_file):
                     print(f"\u274c Impossibile caricare {m3u_file}")
-                    return
+                    return False
             else:
-                m3u_files = find_m3u_files()
-                if m3u_files:
-                    if not self.load_m3u(m3u_files[0]):
+                candidates: List[Path] = discover_m3u_files(Path.cwd())
+                if candidates:
+                    if not self.load_m3u(candidates[0]):
                         print("\u274c Errore caricamento M3U")
-                        return
+                        return False
                 else:
                     print("\u274c Nessun file M3U trovato")
                     print(f"Uso: python3 {Path(sys.argv[0]).name} [file.m3u]")
-                    return
+                    return False
 
-            self.tray.start()
+            if self.use_tray:
+                self.tray.start()
 
-            self._submit_worker(self.handle_input)
+            if self.use_rich:
+                set_console_logging(False)
+
+            self._spawn_thread(self.handle_input, name="Input")
 
             if self.use_rich:
                 self._run_rich_loop()
             else:
                 self._run_tui_loop()
+            success = True
 
         except KeyboardInterrupt:
             logger.info("Interrotto da utente (Ctrl+C)")
+            success = True
         except Exception as e:
             logger.error(f"Errore critico: {e}", exc_info=True)
+            fatal_error = str(e)
         finally:
             self.running = False
-            self._executor_closed = True
+            self._cancel_config_save()
             self.stop()
             self.metadata_monitor.stop()
-            self.tray.stop()
-            self.executor.shutdown(wait=False)
+            if self.use_tray:
+                self.tray.stop()
+            try:
+                self._save_user_config()
+                self.history.export(self.history_file)
+            except Exception:
+                logger.debug("Salvataggio stato finale fallito", exc_info=True)
             self.restore_terminal()
 
             if self.use_rich:
                 self.console.clear()
+                set_console_logging(True)
             else:
                 os.system('clear' if os.name == 'posix' else 'cls')
 
+            if fatal_error:
+                print(f"\u274c Errore: {fatal_error}")
             print("\U0001f44b Arrivederci!")
             logger.info("Applicazione terminata")
 
+        return success
+
     def _run_rich_loop(self):
-        """Loop principale con Rich UI"""
+        """Loop principale con Rich UI, aggiornato solo quando serve."""
         logger.info("Avvio loop Rich UI")
 
-        with Live(self._render_rich(), console=self.console,
-                  refresh_per_second=8, screen=True) as live:
+        with Live(
+            self._render_rich(),
+            console=self.console,
+            screen=True,
+            auto_refresh=False,
+            vertical_overflow="crop",
+        ) as live:
             self.live = live
 
             last_timer_update = 0.0
+            last_animation_update = 0.0
 
             while self.running:
                 current_time = time.time()
+                flags = self.pending_updates
 
                 if current_time - last_timer_update >= 1.0:
-                    self.pending_updates |= UpdateFlags.TIMER
+                    flags |= UpdateFlags.TIMER
+                    if self.state.is_playing and not self.state.is_paused:
+                        flags |= UpdateFlags.SONG
                     last_timer_update = current_time
 
-                if self.state.is_playing:
-                    self.pending_updates |= UpdateFlags.SONG
+                # Equalizer a ~2.5 fps, non a 8 fps come prima.
+                if (
+                    self.state.is_playing
+                    and not self.state.is_paused
+                    and current_time - last_animation_update >= 0.4
+                ):
+                    flags |= UpdateFlags.SONG
+                    last_animation_update = current_time
 
-                if self.temp_message and (current_time - self.temp_message_time) < 2:
-                    self.pending_updates |= UpdateFlags.STATUS
+                if self.temp_message:
+                    if current_time - self.temp_message_time < 2.0:
+                        flags |= UpdateFlags.STATUS
+                    else:
+                        self.temp_message = ""
+                        flags |= UpdateFlags.STATUS
 
-                if self.pending_updates != UpdateFlags.NONE or self.state.is_playing:
-                    live.update(self._render_rich())
-                    self.pending_updates = UpdateFlags.NONE
+                if flags != UpdateFlags.NONE:
+                    live.update(self._render_rich(), refresh=True)
+                    self.pending_updates = UpdateFlags(
+                        self.pending_updates.value & ~flags.value
+                    )
 
-                time.sleep(0.125)
+                time.sleep(0.1)
+
+            self.live = None
 
     def _run_tui_loop(self):
-        """Loop principale con TUI base (fallback)"""
+        """Loop principale con TUI base (fallback senza Rich)."""
         logger.info("Avvio loop TUI base")
 
         os.system('clear' if os.name == 'posix' else 'cls')
@@ -1156,33 +1793,36 @@ class RadioPlayer(RichUIMixin):
         print("\U0001f3b5 RADIO PLAYER M3U")
         print("=" * 70)
         print("\nModalita' TUI base (installa 'rich' per UI migliorata)")
-        print("\nComandi: p=play, q=quit, \u2191/\u2193=seleziona, +/-=volume, m=muto\n")
+        print("\nComandi: p=play  x=stop  n/N=stazione  +/-=volume  m=muto")
+        print("          /=cerca  g=gruppi  f=preferiti  ?=aiuto  q=esci\n")
+
+        try:
+            width = os.get_terminal_size().columns
+        except OSError:
+            width = 80
 
         while self.running:
             current_time = time.time()
 
             if current_time - self.last_render_time >= 1.0:
                 status = "\u25b6\ufe0f Playing" if self.state.is_playing else "\u23f9\ufe0f Stopped"
+                if self.state.is_paused:
+                    status = "\u23f8\ufe0f Paused"
 
                 if self.state.playing_station_index >= 0:
                     station = self.stations[self.state.playing_station_index]
-                    print(f"\r{status} | {station.name[:40]:<40} | Vol: {self.state.volume}%", end="", flush=True)
+                    name = station.name
+                elif self._preview_station is not None:
+                    name = f"{self._preview_station.name} (anteprima)"
                 else:
-                    print(f"\r{status} | {'No station':<40} | Vol: {self.state.volume}%", end="", flush=True)
+                    name = "Nessuna stazione"
 
+                song = self.state.stream_info.song
+                line = (
+                    f"{status} | {name[:40]:<40} | Vol: {self.state.volume:3d}%"
+                    + (f" | {song[:35]}" if song else "")
+                )
+                print(f"\r{line[:max(20, width - 1)].ljust(max(20, width - 1))}", end="", flush=True)
                 self.last_render_time = current_time
 
             time.sleep(0.1)
-
-    @staticmethod
-    def _find_m3u_files() -> List[Path]:
-        """Cerca file M3U nella directory dello script e nella directory corrente"""
-        found: dict = {}
-        for directory in (Path(__file__).parent, Path.cwd()):
-            for f in sorted(directory.glob('*.m3u')):
-                found[f.resolve()] = f
-        return list(found.values())
-
-
-# Alias per la funzione top-level (usata da run())
-find_m3u_files = RadioPlayer._find_m3u_files

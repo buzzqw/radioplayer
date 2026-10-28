@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "radioplayer"
-version = "3.0.0"
+version = "3.1.0"
 description = "Terminal-based internet radio player with Rich TUI, ICY metadata, recording, and RadioBrowser integration"
 license = {text = "GPL-3.0"}
 readme = "README.md"

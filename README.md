@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-GPL%20v3-green)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
-![Version](https://img.shields.io/badge/Version-3.0-orange)
+![Version](https://img.shields.io/badge/Version-3.1-orange)
 
 Lettore di stazioni radio da terminale, **cross-platform** (Linux · macOS · Windows), con interfaccia TUI colorata basata su [Rich](https://github.com/Textualize/rich), metadati in tempo reale, registrazione stream e ricerca integrata su [RadioBrowser.info](https://www.radio-browser.info).
 
@@ -34,10 +34,11 @@ Lettore di stazioni radio da terminale, **cross-platform** (Linux · macOS · Wi
 │       6  Smooth Jazz                                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭─ 🎮 Controlli ───────────────────────────────────────────────────────────────╮
-│ ↑/↓ Seleziona stazione    +/= Alza volume   p/Spazio Play/Pausa  -/_ Vol-    │
-│ m Muto  1-9+↵ Vai a #  r Rec  l Log  t Notifiche  h Cronologia  s Salva     │
-│ b RadioBrowser  g Gruppi  * Preferiti  d Rimuovi  / Cerca  e EQ  ? Aiuto     │
-│ a-z Salta lettera  q Esci                                                    │
+│ ↑/↓ Seleziona  p/Spazio Play/Pausa  x Stop                                   │
+│ n/N Stazione   +/- Volume           m Muto                                   │
+│ /   Cerca      g Gruppi             f Preferiti                              │
+│ b   RadioBrowser d Rimuovi          e EQ                                     │
+│ ?   Aiuto      q Esci               * Preferito                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -136,20 +137,23 @@ Apri una ricerca globale su 40.000+ stazioni direttamente dal terminale:
 | 🎵 | Metadati automatici via ICY: artista, titolo, timer e **equalizer animato** |
 | 📊 | Statistiche live: bitrate, codec, stato del buffer (colorato in base al livello) |
 | 🔊 | Volume con **barra visuale** (es. `████████░░`) e controllo istantaneo |
-| 📁 | **Filtro per gruppo** M3U (`g`) e separatori di gruppo nel pannello stazioni |
-| ⭐ | **Preferiti** (`*`): stazioni marcate con ★, salvati nella configurazione |
+| 📁 | **Filtro per gruppo** M3U (`g` apre il selettore con conteggi, `G` cicla) e separatori di gruppo nel pannello stazioni |
+| ⭐ | **Preferiti** (`*`) e vista **solo preferiti** (`f`), salvati nella configurazione |
 | 🔍 | Ricerca nel M3U locale (`/`) con evidenziazione del testo che combacia |
 | 🔤 | **Jump per lettera** (`a`–`z`): salta alla stazione che inizia con quella lettera |
 | 🎚️ | **Preset equalizzatore** (`e`): Flat, Bass Boost, Voice, Classical, Rock |
 | 💡 | **Schermata aiuto** (`?`) con tutti i comandi |
+| 📐 | **Layout adattivo**: pannelli e numero di stazioni si adattano all'altezza del terminale |
+| ⏯️ | Pausa reale via MPV, stop (`x`) e stazione successiva/precedente (`n`/`N`) |
 | 🌐 | Ricerca su RadioBrowser.info — 40.000+ stazioni per popolarità |
 | ➕ | Aggiunta al M3U da RadioBrowser con controllo duplicati automatico |
 | 👂 | Anteprima di una stazione prima di salvarla |
-| 🔴 | Registrazione dello stream in MP3 tramite ffmpeg |
-| 📜 | Cronologia brani (ultimi 100), esportabile in JSON |
+| 🔴 | Registrazione dello stream con ffmpeg, fallback automatico a `stream-record` di MPV |
+| 📜 | Cronologia brani (ultimi 100), persistente e esportabile in JSON |
 | 🔔 | Notifiche desktop native al cambio brano (`notify-send` / Toast) |
 | 📝 | Logging su file rotante, attivabile a runtime senza riavvio |
 | ⚙️ | **Configurazione persistente** (`~/.config/radioplayer/config.json`) |
+| 💾 | Riprende l'ultima **stazione selezionata**; con `--last` anche l'ultima playlist |
 | 🖼️ | Icona nel system tray: play/pausa, stop, muto, volume, **stazione prec./succ.** |
 | 🛡️ | Pulizia corretta di MPV all'uscita, anche su chiusura forzata (SIGHUP/SIGTERM) |
 
@@ -171,7 +175,7 @@ pip3 install -r requirements.txt
 python3 radioplayer.py stations.m3u
 ```
 
-`python3 radioplayer.py` lancia direttamente la radio: se non specifichi un file, cerca automaticamente i `.m3u` nella cartella corrente (e in quella dello script) e ti fa scegliere se ce ne sono più di uno.
+`python3 radioplayer.py` lancia direttamente la radio: se non specifichi un file, cerca automaticamente i `.m3u` nella cartella corrente (e in quella dello script) e ti fa scegliere se ce ne sono più di uno. Con `--last` riprende invece l'ultima playlist usata.
 
 ---
 
@@ -228,9 +232,23 @@ python3 radioplayer.py mie_radio.m3u
 
 # Auto-rileva i file .m3u nella cartella corrente
 python3 radioplayer.py
+
+# Riprende l'ultima playlist usata
+python3 radioplayer.py --last
+
+# Info e versione
+python3 radioplayer.py --help
+python3 radioplayer.py --version
+
+# Solo elenco stazioni
+python3 radioplayer.py --list stations.m3u
+
+# Opzioni utili
+python3 radioplayer.py --no-tray --no-color --volume 70 stations.m3u
+python3 radioplayer.py --ao null stations.m3u   # test senza audio
 ```
 
-All'avvio viene selezionata automaticamente la prima stazione. Premi `p` o `Spazio` per iniziare ad ascoltare.
+All'avvio riprende l'ultima stazione selezionata (se ancora presente nella playlist). Premi `p` o `Spazio` per iniziare ad ascoltare.
 
 ---
 
@@ -261,15 +279,22 @@ http://icestreaming.rai.it/1.mp3
 
 | Tasto | Azione |
 |-------|--------|
-| `↑` `↓` | Seleziona stazione |
-| `p` · `Spazio` · `Invio` | Play / Pausa |
+| `↑` `↓` | Seleziona stazione (nella vista filtrata) |
+| `PgUp` `PgDn` | Salta di 5 stazioni |
+| `Home` `End` | Prima / ultima stazione visibile |
+| `p` · `Spazio` · `Invio` | Play / Pausa reale |
+| `n` `N` | Stazione successiva / precedente (se in riproduzione cambia subito) |
+| `x` | Stop |
 | `+` `=` · `-` `_` | Volume +5% / −5% |
 | `m` | Muto / Riattiva audio |
 | `1`–`9` poi `Invio` | Salta alla stazione numero N |
-| `a`–`z` | Salta alla prima stazione che inizia con quella lettera |
-| `g` | Cicla il filtro per gruppo |
+| `a`–`z` | Salta alla prossima stazione visibile con quella iniziale |
+| `g` | Apre il selettore gruppi (con conteggi) |
+| `G` | Cicla rapidamente il filtro gruppo |
+| `f` | Mostra / nasconde solo i preferiti |
 | `*` | Aggiungi / rimuovi preferito |
-| `d` | Rimuovi stazione dalla lista e dal file M3U |
+| `d` | Rimuovi stazione (premi `d` due volte per confermare) |
+| `u` | Annulla l'ultima rimozione (entro 15 secondi) |
 | `/` | Ricerca nel M3U locale |
 | `e` | Cicla i preset equalizzatore |
 | `?` | Schermata aiuto |
@@ -279,6 +304,7 @@ http://icestreaming.rai.it/1.mp3
 | `l` | Log su file ON/OFF |
 | `h` | Cronologia brani |
 | `s` | Esporta la cronologia in JSON |
+| `Esc` | Chiude gli overlay o rimuove i filtri attivi |
 | `q` | Esci |
 
 ### Ricerca locale (`/`)
@@ -296,6 +322,8 @@ http://icestreaming.rai.it/1.mp3
 |-------|--------|
 | *(digita)* | Cerca — automatica dopo 0,3 s |
 | `↑` `↓` | Naviga tra i risultati |
+| `PgUp` `PgDn` | Salta di 10 risultati |
+| `Tab` | Carica altri 20 risultati |
 | `Invio` | Aggiunge la stazione al M3U |
 | `p` | Anteprima / ferma (toggle sulla stessa stazione) |
 | *(digita)* | Spazio incluso — scrivi query multi-parola |

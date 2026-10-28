@@ -20,7 +20,11 @@ if __name__ == "__main__":
         print("   Installa le dipendenze con:")
         print("       pip install -r requirements.txt")
         print("   oppure:")
-        print("       pip install rich requests pystray Pillow")
+        print("       pip install rich requests pystray Pillow urllib3")
         sys.exit(1)
 
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n\U0001f44b Arrivederci!")
+        sys.exit(130)

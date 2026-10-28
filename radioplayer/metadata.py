@@ -41,6 +41,29 @@ class MetadataHistory:
         except OSError as e:
             logger.error(f"Errore esportazione cronologia: {e}")
 
+    def load(self, path: Path):
+        """Carica la cronologia da JSON, ignorando voci non valide."""
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                return
+            self.history.clear()
+            limit = self.history.maxlen or len(data)
+            for entry in data[-limit:]:
+                if not isinstance(entry, dict):
+                    continue
+                self.history.append({
+                    'artist': str(entry.get('artist', '') or ''),
+                    'song': str(entry.get('song', '') or ''),
+                    'station': str(entry.get('station', '') or ''),
+                    'timestamp': str(entry.get('timestamp', '') or ''),
+                })
+            logger.info(f"Cronologia caricata da {path} ({len(self.history)} voci)")
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            logger.warning(f"Errore caricamento cronologia: {e}")
+
     def get_last(self, n: int = 10) -> List[Dict]:
         """Restituisce gli ultimi n brani"""
         return list(self.history)[-n:]
@@ -54,16 +77,19 @@ class MetadataMonitor:
         self.running = False
         self.current_url: Optional[str] = None
         self._response: Optional[requests.Response] = None
+        self._generation = 0
         self.received_title = False
         logger.info("Inizializzato MetadataMonitor")
 
     def start(self, url: str):
+        self._generation += 1
         self.current_url = url
         self.running = True
         self.received_title = False
         logger.info(f"Avviato monitoraggio metadata per: {url}")
 
     def stop(self):
+        self._generation += 1
         self.running = False
         self.current_url = None
         resp = self._response
@@ -77,7 +103,12 @@ class MetadataMonitor:
 
     def monitor_loop(self):
         """Loop di monitoraggio metadata ICY"""
-        while self.running and self.current_url:
+        generation = self._generation
+        while (
+            self.running
+            and self.current_url
+            and generation == self._generation
+        ):
             resp = None
             try:
                 headers = {'Icy-MetaData': '1', 'User-Agent': 'RadioPlayer/3.0'}
@@ -99,7 +130,7 @@ class MetadataMonitor:
                 metaint = int(metaint)
                 logger.debug(f"ICY metaint: {metaint}")
 
-                while self.running:
+                while self.running and generation == self._generation:
                     try:
                         audio_data = resp.raw.read(metaint)
                         if not audio_data:
@@ -125,11 +156,11 @@ class MetadataMonitor:
                         break
 
             except requests.RequestException as e:
-                if self.running:
+                if self.running and generation == self._generation:
                     logger.warning(f"Errore richiesta metadata: {e}")
                     time.sleep(5)
             except Exception as e:
-                if self.running:
+                if self.running and generation == self._generation:
                     logger.error(f"Errore monitor metadata: {e}", exc_info=True)
                     time.sleep(5)
             finally:
@@ -138,6 +169,7 @@ class MetadataMonitor:
                         resp.close()
                     except Exception:
                         pass
-                self._response = None
+                if self._response is resp:
+                    self._response = None
 
         logger.info("Loop metadata terminato")
