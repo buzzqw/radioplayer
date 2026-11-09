@@ -9,6 +9,9 @@
   disabilitare l'icona in silenzio.
 - System tray: avvio più robusto, con log del backend usato e protezione degli
   aggiornamenti grafici da errori che non devono fermare il player.
+- RadioBrowser: se la verifica del certificato TLS fallisce (CA locale mancante
+  o certificato non valido) la ricerca riprova automaticamente senza verifica,
+  invece di restare bloccata da un errore di rete.
 
 ### UX
 
@@ -16,6 +19,12 @@
 - Menu del tray: volume con preset (0/25/50/75/100%), incrementi ±5% e muto
   con spunta; volume visibile anche nel tooltip.
 - `python-xlib` aggiunto alle dipendenze Linux per il backend Xorg di pystray.
+
+### Prestazioni
+
+- UI Rich: refresh di orologio, uptime ed equalizer ogni 5 secondi (invece di
+  ogni secondo); i messaggi temporanei non forzano più ridisegni a 10 fps.
+  Consumo CPU ulteriormente ridotto.
 
 ## 3.1.0
 

@@ -4,6 +4,8 @@ import logging
 from typing import List, Optional
 
 import requests
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
 
 from .m3u import M3UParser
 from .models import RadioStation
@@ -24,35 +26,57 @@ class RadioBrowserAPI:
         self.last_error: Optional[str] = None
         self._cache: dict = {}
         self._cache_order: list = []
+        self._insecure_base: Optional[str] = None
 
     def _get(self, path: str, params: dict) -> Optional[object]:
-        """Tenta la richiesta sugli endpoint, cachando quello funzionante."""
+        """Tenta la richiesta sugli endpoint, cachando quello funzionante.
+
+        Se la verifica del certificato TLS fallisce, riprova in modalità
+        insicura (verify=False) anziché bloccare la ricerca.
+        """
         bases = []
         if self._working_base:
             bases.append(self._working_base)
         bases += [b for b in self._BASE_URLS if b != self._working_base]
 
         for base in bases:
-            try:
-                resp = requests.get(
-                    f"{base}{path}",
-                    params=params,
-                    headers=self.HEADERS,
-                    timeout=5,
-                )
-                resp.raise_for_status()
-                RadioBrowserAPI._working_base = base
-                self.last_error = None
-                return resp.json()
-            except requests.Timeout:
-                self.last_error = "Timeout nella connessione a RadioBrowser"
-                logger.warning(f"RadioBrowser: timeout su {base}")
-            except requests.RequestException as e:
-                self.last_error = f"Errore di rete: {e}"
-                logger.warning(f"RadioBrowser: {base} \u2014 {e}")
-            except ValueError as e:
-                self.last_error = "Risposta non valida da RadioBrowser"
-                logger.warning(f"RadioBrowser: risposta non valida \u2014 {e}")
+            url = f"{base}{path}"
+            verify = base != self._insecure_base
+            while True:
+                try:
+                    resp = requests.get(
+                        url,
+                        params=params,
+                        headers=self.HEADERS,
+                        timeout=5,
+                        verify=verify,
+                    )
+                    resp.raise_for_status()
+                    RadioBrowserAPI._working_base = base
+                    self._insecure_base = None if verify else base
+                    self.last_error = None
+                    return resp.json()
+                except requests.exceptions.SSLError as e:
+                    if verify:
+                        urllib3.disable_warnings(InsecureRequestWarning)
+                        logger.warning(
+                            "RadioBrowser: certificato TLS non valido su %s, "
+                            "riprovo senza verifica", base,
+                        )
+                        verify = False
+                        continue
+                    self.last_error = f"Errore di rete: {e}"
+                    logger.warning(f"RadioBrowser: {base} \u2014 {e}")
+                except requests.Timeout:
+                    self.last_error = "Timeout nella connessione a RadioBrowser"
+                    logger.warning(f"RadioBrowser: timeout su {base}")
+                except requests.RequestException as e:
+                    self.last_error = f"Errore di rete: {e}"
+                    logger.warning(f"RadioBrowser: {base} \u2014 {e}")
+                except ValueError as e:
+                    self.last_error = "Risposta non valida da RadioBrowser"
+                    logger.warning(f"RadioBrowser: risposta non valida \u2014 {e}")
+                break
         return None
 
     def search(self, query: str, limit: int = 20, offset: int = 0) -> List[RadioStation]:

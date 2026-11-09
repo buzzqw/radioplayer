@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import requests
+
 from radioplayer.radio_browser import RadioBrowserAPI
 
 
@@ -65,3 +67,22 @@ def test_search_invalid_payload_sets_error():
         get.return_value = FakeResponse({"error": "bad"})
         assert api.search("radio") == []
         assert api.last_error is not None
+
+
+def test_search_falls_back_on_certificate_error():
+    """Se il certificato TLS non è verificabile, riprova senza verifica."""
+    api = RadioBrowserAPI()
+    api._insecure_base = None
+    with patch("radioplayer.radio_browser.requests.get") as get:
+        get.side_effect = [
+            requests.exceptions.SSLError("certificate verify failed"),
+            FakeResponse(make_payload(3)),
+        ]
+
+        result = api.search("radio24")
+
+        assert len(result) == 3
+        assert get.call_count == 2
+        assert get.call_args_list[0].kwargs["verify"] is True
+        assert get.call_args_list[1].kwargs["verify"] is False
+        assert api._insecure_base is not None
