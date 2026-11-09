@@ -252,6 +252,44 @@ class TestUIRendering:
             )
             assert player._render_rich() is not None
 
+    def test_timer_flag_regenerates_header(self, player):
+        """Il clock nell'header deve aggiornarsi quando il loop segnala TIMER."""
+        self.make_console(player)
+        player._render_rich()
+        header = player._ric_header
+
+        player.pending_updates = UpdateFlags.NONE
+        player._render_rich(UpdateFlags.TIMER)
+        assert player._ric_header is not header
+
+    def test_update_flags_are_rate_limited(self, player):
+        """Il loop non deve ridisegnare più di una volta ogni 5 secondi."""
+        player.pending_updates = UpdateFlags.NONE
+        player.state.is_playing = False
+
+        flags, last = player._collect_update_flags(1000.0, 0.0)
+        assert flags & UpdateFlags.TIMER
+
+        flags, last = player._collect_update_flags(1003.0, last)
+        assert flags == UpdateFlags.NONE
+
+        flags, last = player._collect_update_flags(1005.0, last)
+        assert flags & UpdateFlags.TIMER
+
+    def test_visible_temp_message_is_not_redrawn(self, player):
+        """Il messaggio temporaneo è statico: refresh solo alla scadenza."""
+        player.pending_updates = UpdateFlags.NONE
+        player.state.is_playing = False
+        player.temp_message = "ciao"
+        player.temp_message_time = 1000.0
+
+        flags, _ = player._collect_update_flags(1001.0, 1001.0)
+        assert not (flags & UpdateFlags.STATUS)
+
+        flags, _ = player._collect_update_flags(1002.5, 1002.5)
+        assert flags & UpdateFlags.STATUS
+        assert player.temp_message == ""
+
     def test_markup_in_names_does_not_break(self, player):
         self.make_console(player)
         player.stations[0] = RadioStation(

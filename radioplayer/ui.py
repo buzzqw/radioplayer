@@ -758,8 +758,12 @@ class RichUIMixin:
     # Render principale
     # ------------------------------------------------------------------
 
-    def _render_rich(self) -> Optional[Any]:
-        """Renderizza interfaccia completa Rich. Rende solo i pannelli segnati dai flag."""
+    def _render_rich(self, flags: Optional[UpdateFlags] = None) -> Optional[Any]:
+        """Renderizza interfaccia completa Rich. Rende solo i pannelli segnati dai flag.
+
+        `flags` contiene gli aggiornamenti calcolati dal loop (es. TIMER, SONG)
+        che non sono ancora stati scritti in `pending_updates`.
+        """
         if not RICH_AVAILABLE:
             return None
 
@@ -790,7 +794,7 @@ class RichUIMixin:
             return self._render_rich_help()
 
         layout = self._build_rich_layout()
-        flags = self.pending_updates
+        flags = self.pending_updates | (flags or UpdateFlags.NONE)
 
         # Prima volta o FULL: rigenera tutto
         if (

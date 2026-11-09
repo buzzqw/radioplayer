@@ -30,6 +30,10 @@ from .ui import RichUIMixin, RICH_AVAILABLE, Live
 
 logger = setup_logging()
 
+# Intervallo (secondi) con cui la UI Rich aggiorna orologio, uptime e equalizer.
+# Un refresh Rich ridisegna l'intera schermata, quindi tenerlo alto aiuta la CPU.
+RICH_REFRESH_INTERVAL = 5.0
+
 if platform.system() == "Windows":
     import msvcrt
 else:
@@ -1736,6 +1740,27 @@ class RadioPlayer(RichUIMixin):
 
         return success
 
+    def _collect_update_flags(self, now: float, last_timer_update: float) -> Tuple[UpdateFlags, float]:
+        """Calcola i flag per il loop Rich, evitando refresh inutili.
+
+        Orologio, uptime ed equalizer vengono aggiornati a cicli di
+        RICH_REFRESH_INTERVAL secondi. I messaggi temporanei sono statici:
+        vanno ridisegnati solo alla scadenza.
+        """
+        flags = self.pending_updates
+
+        if now - last_timer_update >= RICH_REFRESH_INTERVAL:
+            flags |= UpdateFlags.TIMER
+            if self.state.is_playing and not self.state.is_paused:
+                flags |= UpdateFlags.SONG
+            last_timer_update = now
+
+        if self.temp_message and now - self.temp_message_time >= 2.0:
+            self.temp_message = ""
+            flags |= UpdateFlags.STATUS
+
+        return flags, last_timer_update
+
     def _run_rich_loop(self):
         """Loop principale con Rich UI, aggiornato solo quando serve."""
         logger.info("Avvio loop Rich UI")
@@ -1750,36 +1775,15 @@ class RadioPlayer(RichUIMixin):
             self.live = live
 
             last_timer_update = 0.0
-            last_animation_update = 0.0
 
             while self.running:
                 current_time = time.time()
-                flags = self.pending_updates
-
-                if current_time - last_timer_update >= 1.0:
-                    flags |= UpdateFlags.TIMER
-                    if self.state.is_playing and not self.state.is_paused:
-                        flags |= UpdateFlags.SONG
-                    last_timer_update = current_time
-
-                # Equalizer a ~2.5 fps, non a 8 fps come prima.
-                if (
-                    self.state.is_playing
-                    and not self.state.is_paused
-                    and current_time - last_animation_update >= 0.4
-                ):
-                    flags |= UpdateFlags.SONG
-                    last_animation_update = current_time
-
-                if self.temp_message:
-                    if current_time - self.temp_message_time < 2.0:
-                        flags |= UpdateFlags.STATUS
-                    else:
-                        self.temp_message = ""
-                        flags |= UpdateFlags.STATUS
+                flags, last_timer_update = self._collect_update_flags(
+                    current_time, last_timer_update
+                )
 
                 if flags != UpdateFlags.NONE:
-                    live.update(self._render_rich(), refresh=True)
+                    live.update(self._render_rich(flags), refresh=True)
                     self.pending_updates = UpdateFlags(
                         self.pending_updates.value & ~flags.value
                     )
