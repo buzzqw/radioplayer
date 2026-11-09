@@ -1,5 +1,22 @@
 # Changelog
 
+## Non rilasciato
+
+### Correzioni
+
+- System tray: se `pystray` o il backend grafico mancano, all'avvio viene
+  mostrato un avviso esplicito (con il comando di installazione) invece di
+  disabilitare l'icona in silenzio.
+- System tray: avvio più robusto, con log del backend usato e protezione degli
+  aggiornamenti grafici da errori che non devono fermare il player.
+
+### UX
+
+- Menu del tray: stazione e titolo della traccia audio su righe separate.
+- Menu del tray: volume con preset (0/25/50/75/100%), incrementi ±5% e muto
+  con spunta; volume visibile anche nel tooltip.
+- `python-xlib` aggiunto alle dipendenze Linux per il backend Xorg di pystray.
+
 ## 3.1.0
 
 ### Correzioni

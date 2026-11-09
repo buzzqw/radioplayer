@@ -25,7 +25,7 @@ from .metadata import MetadataHistory, MetadataMonitor
 from .models import RadioStation, StreamInfo, PlayerState, UpdateFlags
 from .mpv_controller import MPVController
 from .radio_browser import RadioBrowserAPI
-from .tray import SystemTrayIcon
+from .tray import SystemTrayIcon, tray_unavailable_message
 from .ui import RichUIMixin, RICH_AVAILABLE, Live
 
 logger = setup_logging()
@@ -1685,8 +1685,12 @@ class RadioPlayer(RichUIMixin):
                     print(f"Uso: python3 {Path(sys.argv[0]).name} [file.m3u]")
                     return False
 
-            if self.use_tray:
-                self.tray.start()
+            if self.use_tray and not self.tray.start():
+                # Il warning deve essere visibile: con la UI Rich il logging
+                # su console viene silenziato, quindi lo stampiamo prima.
+                message = self.tray.error_message() or tray_unavailable_message()
+                print(f"\u26a0\ufe0f  {message}")
+                print()
 
             if self.use_rich:
                 set_console_logging(False)

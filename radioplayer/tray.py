@@ -1,6 +1,7 @@
 """System tray icon con menu contestuale."""
 
 import logging
+import platform
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -11,14 +12,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger("RadioPlayer")
 
 TRAY_AVAILABLE = False
+TRAY_IMPORT_ERROR = ""
+TRAY_BACKEND = ""
 
 try:
     import pystray
     from pystray import Icon as TrayIcon, MenuItem as TrayItem, Menu as TrayMenu
     from PIL import Image as PILImage, ImageDraw as PILDraw
     TRAY_AVAILABLE = True
-except ImportError:
-    pass
+    TRAY_BACKEND = TrayIcon.__module__.rsplit(".", 1)[-1]
+except Exception as exc:  # ImportError, oppure backend grafico non disponibile
+    TRAY_IMPORT_ERROR = str(exc)
+
+
+def tray_unavailable_message() -> str:
+    """Messaggio esplicativo quando l'icona tray non può essere creata."""
+    if TRAY_AVAILABLE:
+        return ""
+    detail = f" ({TRAY_IMPORT_ERROR})" if TRAY_IMPORT_ERROR else ""
+    if platform.system() == "Linux":
+        return (
+            "System tray non disponibile: installa pystray e Pillow"
+            " (Arch: sudo pacman -S python-pystray python-pillow;"
+            " Debian/Ubuntu: sudo apt install python3-pystray python3-pil)"
+            f"{detail}"
+        )
+    return (
+        "System tray non disponibile: installa pystray e Pillow"
+        f" con 'pip install pystray Pillow'{detail}"
+    )
 
 
 class SystemTrayIcon:
@@ -33,6 +55,11 @@ class SystemTrayIcon:
         self._update_lock = threading.Lock()
         self._last_update = 0.0
         self._update_timer: Optional[threading.Timer] = None
+        self._start_error = ""
+
+    def error_message(self) -> str:
+        """Motivo per cui l'icona tray non è disponibile (vuoto se attiva)."""
+        return self._start_error or tray_unavailable_message()
 
     def _make_icon_image(self, playing: bool = True, muted: bool = False) -> Any:
         """Crea un'immagine PIL per l'icona tray (nota musicale colorata)"""
@@ -80,6 +107,15 @@ class SystemTrayIcon:
         self.player.change_volume(-5)
         self._refresh_menu()
 
+    def _action_set_volume(self, value: int):
+        """Imposta il volume a un valore assoluto (usato dal sottomenu)."""
+        return lambda icon=None, item=None: self._set_volume(value)
+
+    def _set_volume(self, value: int):
+        value = max(0, min(100, int(value)))
+        self.player.change_volume(value - self.player.state.volume)
+        self._refresh_menu()
+
     def _action_next_station(self, icon=None, item=None):
         self.player.change_selection(1)
         self.player.play_selected()
@@ -98,31 +134,46 @@ class SystemTrayIcon:
         """Costruisce il menu contestuale con stato corrente"""
         st = self.player.state
 
-        if st.stream_info and st.stream_info.song:
-            song_label = f"\U0001f3b5 {st.stream_info.song[:50]}"
-        elif st.playing_station_index >= 0 and self.player.stations:
-            song_label = f"\U0001f4fb {self.player.stations[st.playing_station_index].name[:50]}"
+        if st.playing_station_index >= 0 and self.player.stations:
+            station_label = f"\U0001f4fb {self.player.stations[st.playing_station_index].name[:50]}"
         else:
-            song_label = "\U0001f4fb Radio Player"
+            station_label = "\U0001f4fb Radio Player"
+
+        if st.stream_info and st.stream_info.song:
+            song_label = f"\U0001f3b5 {st.stream_info.song[:60]}"
+        elif st.is_playing:
+            song_label = "\U0001f3b5 Titolo non disponibile"
+        else:
+            song_label = "\U0001f3b5 Nessuna traccia"
 
         play_label = "\u23f8  Pausa" if (st.is_playing and not st.is_paused) else "\u25b6  Play"
-        mute_label = "\U0001f507 Riattiva audio" if st.is_muted else "\U0001f507 Muto"
+        mute_label = "\U0001f50a Riattiva audio" if st.is_muted else "\U0001f507 Muto"
         vol_label = f"\U0001f50a Volume: {st.volume}%"
 
+        volume_items = [
+            TrayItem("\U0001f50a Volume +5%", self._action_vol_up5),
+            TrayItem("\U0001f509 Volume -5%", self._action_vol_down5),
+            TrayMenu.SEPARATOR,
+        ]
+        for level in (0, 25, 50, 75, 100):
+            check = "\u2713" if level == st.volume else "  "
+            volume_items.append(
+                TrayItem(f"{check}  {level}%", self._action_set_volume(level))
+            )
+        volume_menu = TrayMenu(*volume_items)
+
         return TrayMenu(
+            TrayItem(station_label, None, enabled=False),
             TrayItem(song_label, None, enabled=False),
             TrayMenu.SEPARATOR,
-            TrayItem(play_label, self._action_play_pause),
+            TrayItem(play_label, self._action_play_pause, default=True),
             TrayItem("\u23f9  Stop", self._action_stop),
             TrayMenu.SEPARATOR,
             TrayItem("\u23ed  Stazione successiva", self._action_next_station),
             TrayItem("\u23ee  Stazione precedente", self._action_prev_station),
             TrayMenu.SEPARATOR,
-            TrayItem(mute_label, self._action_mute),
-            TrayMenu.SEPARATOR,
-            TrayItem(vol_label, None, enabled=False),
-            TrayItem("\U0001f50a Volume +5%", self._action_vol_up5),
-            TrayItem("\U0001f509 Volume -5%", self._action_vol_down5),
+            TrayItem(mute_label, self._action_mute, checked=lambda item: st.is_muted),
+            TrayItem(vol_label, volume_menu),
             TrayMenu.SEPARATOR,
             TrayItem("\u274c Esci", self._action_quit),
         )
@@ -131,13 +182,17 @@ class SystemTrayIcon:
         """Aggiorna menu e icona con lo stato corrente"""
         if self._icon is None:
             return
-        st = self.player.state
-        self._icon.icon = self._make_icon_image(
-            playing=st.is_playing and not st.is_paused,
-            muted=st.is_muted,
-        )
-        self._icon.menu = self._build_menu()
-        self._icon.title = self._make_tooltip()
+        try:
+            st = self.player.state
+            self._icon.icon = self._make_icon_image(
+                playing=st.is_playing and not st.is_paused,
+                muted=st.is_muted,
+            )
+            self._icon.menu = self._build_menu()
+            self._icon.title = self._make_tooltip()
+        except Exception as exc:
+            # Un problema grafico non deve mai fermare il player o i metadata.
+            logger.debug("Aggiornamento icona tray fallito: %s", exc)
 
     def _make_tooltip(self) -> str:
         """Crea il testo tooltip per l'icona"""
@@ -156,6 +211,7 @@ class SystemTrayIcon:
         if st.is_muted:
             status += " \U0001f507"
         parts.append(status)
+        parts.append(f"\U0001f50a {st.volume}%")
         return " | ".join(parts) if parts else "Radio Player"
 
     def update(self):
@@ -186,11 +242,24 @@ class SystemTrayIcon:
             self._last_update = time.monotonic()
         self._refresh_menu()
 
-    def start(self):
-        """Avvia l'icona tray in un thread dedicato (non-bloccante)"""
+    def _run(self):
+        """Esegue il loop dell'icona tray nel thread dedicato."""
+        try:
+            self._icon.run()
+        except Exception as exc:
+            logger.error("Errore nel loop dell'icona tray: %s", exc, exc_info=True)
+
+    def start(self) -> bool:
+        """Avvia l'icona tray in un thread dedicato (non-bloccante).
+
+        Restituisce True se l'icona è stata creata correttamente.
+        """
         if not TRAY_AVAILABLE:
-            logger.warning("pystray non disponibile: icona tray disabilitata")
-            return
+            self._start_error = tray_unavailable_message()
+            logger.warning("pystray non disponibile: %s", self._start_error)
+            return False
+        if self._icon is not None:
+            return True
         try:
             self._icon = TrayIcon(
                 name="RadioPlayer",
@@ -199,14 +268,20 @@ class SystemTrayIcon:
                 menu=self._build_menu(),
             )
             self._thread = threading.Thread(
-                target=self._icon.run,
+                target=self._run,
                 name="SystemTray",
                 daemon=True,
             )
             self._thread.start()
-            logger.info("Icona tray avviata")
-        except Exception as e:
-            logger.warning(f"Impossibile avviare icona tray: {e}")
+            self._start_error = ""
+            logger.info("Icona tray avviata (backend %s)", TRAY_BACKEND or "auto")
+            return True
+        except Exception as exc:
+            self._icon = None
+            self._thread = None
+            self._start_error = f"Impossibile avviare l'icona tray: {exc}"
+            logger.warning("%s", self._start_error, exc_info=True)
+            return False
 
     def stop(self):
         """Ferma l'icona tray"""

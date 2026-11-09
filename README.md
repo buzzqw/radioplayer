@@ -196,6 +196,20 @@ sudo dnf install mpv python3 python3-pip libnotify ffmpeg
 pip3 install -r requirements.txt
 ```
 
+### Linux — Arch / Manjaro
+
+```bash
+sudo pacman -S mpv python python-pip libnotify ffmpeg
+# dipendenze Python dai repository di sistema (consigliato)
+sudo pacman -S python-rich python-requests python-urllib3 python-pystray python-pillow
+# oppure, se usi un virtualenv:
+pip3 install -r requirements.txt
+```
+
+> **Nota:** per l'icona nel system tray su Linux servono `pystray` e un backend
+> grafico: AppIndicator/GTK (`python-gobject` + `libappindicator-gtk3`) oppure
+> Xorg (`python-xlib`). Se mancano, il player mostra un avviso all'avvio.
+
 ### macOS
 
 ```bash
@@ -376,6 +390,7 @@ Il log rotante viene scritto in `~/.config/radioplayer/radioplayer.log` quando a
 | [`requests`](https://requests.readthedocs.io) | ≥ 2.31 | Metadati ICY e API RadioBrowser |
 | [`pystray`](https://github.com/moses-palmer/pystray) | ≥ 0.19.5 | Icona system tray |
 | [`Pillow`](https://python-pillow.org) | ≥ 10.0 | Immagine icona tray |
+| [`python-xlib`](https://github.com/python-xlib/python-xlib) | ≥ 0.33 | Backend Xorg del tray (solo Linux) |
 
 ```bash
 pip3 install -r requirements.txt
@@ -425,6 +440,28 @@ ffmpeg -version      # deve rispondere con la versione
 # macOS:         brew install ffmpeg
 # Windows:       scarica da https://ffmpeg.org/download.html
 ```
+
+### L'icona del system tray non appare (Linux)
+
+Verifica che `pystray` sia importabile:
+
+```bash
+python3 -c "import pystray; print(pystray.Icon.__module__)"
+```
+
+Se fallisce, installa i pacchetti:
+
+```bash
+# Arch / Manjaro
+sudo pacman -S python-pystray python-pillow python-xlib
+
+# Debian / Ubuntu
+sudo apt install python3-pystray python3-pil python3-xlib
+```
+
+Su GNOME potrebbe servire l'estensione **AppIndicator**; su XFCE abilita il
+plugin **Status Tray** nel pannello. Se la barra non è disponibile il player
+mostra un avviso all'avvio e continua a funzionare normalmente in terminale.
 
 ### Notifiche non appaiono (Linux)
 

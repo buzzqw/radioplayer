@@ -11,6 +11,8 @@ urllib3>=1.26
 # System tray icon (icona nella barra di sistema)
 pystray>=0.19.5
 Pillow>=10.0.0
+# Backend Xorg di pystray per Linux (alternativa ad AppIndicator/GTK)
+python-xlib>=0.33; sys_platform == "linux"
 
 # === Windows (opzionali) ===
 # pywin32>=306
